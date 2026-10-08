@@ -1,0 +1,35 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# Apply .env → $HERMES_HOME/config.yaml on every container boot, so .env stays the
+# single source of truth across restarts, reboots and machines.
+#
+# Runs as root after 01-hermes-setup (volume chown + config seeding) and before the
+# gateway/dashboard start. `hermes` here is the image's privilege-drop shim, so writes
+# land as the hermes user. Empty variables are skipped (that key keeps whatever is in
+# config.yaml — e.g. a model picked in Desktop). HERMES_APPLY_ENV_CONFIG=0 disables it.
+set -u
+
+case "${HERMES_APPLY_ENV_CONFIG:-1}" in
+    0|false|no) echo "[env-config] disabled (HERMES_APPLY_ENV_CONFIG=0)"; exit 0 ;;
+esac
+
+apply() {
+    [ -n "$2" ] || return 0
+    if hermes config set "$1" "$2" >/dev/null 2>&1; then
+        echo "[env-config] $1 applied"
+    else
+        echo "[env-config] WARN: could not set $1" >&2
+    fi
+}
+
+if [ -n "${LLM_BASE_URL:-}" ]; then
+    apply model.provider custom
+    apply model.base_url "$LLM_BASE_URL"
+    apply model.api_mode "${LLM_API_MODE:-chat_completions}"
+fi
+apply model.default "${LLM_MODEL:-}"
+apply model.api_key "${LLM_API_KEY:-}"
+apply model.context_length "${LLM_CONTEXT_LENGTH:-}"
+apply terminal.cwd "${HERMES_WORKSPACE:-}"
+
+exit 0
