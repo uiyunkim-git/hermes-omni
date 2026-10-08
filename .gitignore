@@ -6,3 +6,6 @@ docker-compose.override.yml
 # 런타임 상태 (config, 세션, 메모리, 스킬, 작업물)
 data/
 workspace/
+
+# Tailscale 노드 상태 (노드 키)
+tailscale/state/
