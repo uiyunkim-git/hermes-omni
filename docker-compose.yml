@@ -1,17 +1,16 @@
 # =====================================================================================
-#  Hermes Agent — Hermes Desktop 원격 백엔드 (GPU + Docker 패스스루)
+#  Hermes Agent — Hermes Desktop 원격 백엔드 (GPU + Docker 패스스루 + Tailscale)
 #
-#  처음이면: ./setup.sh   (.env 생성 → 폴더 준비 → GPU 감지 → 실행)
-#  이후:     docker compose up -d / logs -f / pull
+#  처음이면: ./setup.sh   (.env 입력 → 머신 감지 → docker-compose.override.yml 생성 → 실행)
+#  이후:     docker compose up -d / logs -f / pull     (이 폴더에서)
 #
-#  - .env 가 유일한 설정 원천. 모델·작업 폴더는 컨테이너 부팅마다 config.yaml 에 반영된다
-#    (docker/cont-init.d/10-env-config). 재부팅·다른 머신에서도 같은 상태로 뜬다.
-#  - 모든 상태는 이 폴더 안: ./data (= /opt/data: config, 세션, 메모리, 스킬), ./workspace
-#  - workspace 는 호스트와 "같은 절대 경로"로 마운트 → 에이전트가 `docker run -v $PWD:...` 해도
-#    호스트 경로가 그대로 맞는다.
+#  - .env 에는 사람이 정하는 값만 (LLM, 로그인, Tailscale). 모델·작업 폴더는 컨테이너 부팅마다
+#    config.yaml 에 반영된다 (docker/cont-init.d/10-env-config).
+#  - 머신마다 다른 것(GPU, 작업 폴더 절대 경로, Tailscale 노드)은 setup.sh 가 생성하는
+#    docker-compose.override.yml 에 있다 (git 제외, compose 가 자동으로 읽음).
+#  - 모든 상태는 이 폴더 안: ./data (= /opt/data: config, 세션, 메모리, 스킬, 자동 생성 비밀값),
+#    ./workspace, ./tailscale/state
 #  - Docker: 호스트 docker.sock 패스스루 (= 호스트 root 권한). 소켓 GID 는 이미지가 자동으로 맞춤.
-#  - GPU: compose.gpu.yml (setup.sh 가 nvidia 런타임을 감지하면 COMPOSE_FILE 에 추가)
-#  - 머신 전용 설정은 docker-compose.override.yml (git 제외) 에.
 # =====================================================================================
 services:
   hermes:
@@ -25,10 +24,9 @@ services:
       - HERMES_DASHBOARD_HOST=0.0.0.0
       - HERMES_DASHBOARD_PORT=9119
     ports:
-      # 기본은 호스트 loopback 만. tailnet 노출은 README 의 "접속 경로" 참고.
+      # 호스트 쪽은 기본 loopback 만. 원격 접속은 Tailscale 사이드카로.
       - "${HERMES_BIND:-127.0.0.1}:${HERMES_PORT:-9119}:9119"
     volumes:
       - ./data:/opt/data
-      - ${HERMES_WORKSPACE:?run ./setup.sh first}:${HERMES_WORKSPACE}
       - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
       - ./docker/cont-init.d/10-env-config:/etc/cont-init.d/10-env-config:ro
