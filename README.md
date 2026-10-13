@@ -84,6 +84,8 @@ node는 hub의 tailnet 주소로 접속하므로 **같은 tailnet**에 있어야
 
 **`git pull` 뒤에는 `docker compose up`보다 먼저 `./setup.sh`를 한 번 실행하세요.** Tailscale 사이드카는 이제 예전 `tailscale/serve.json` 대신 `tailscale/config/` 폴더를 마운트하는데, 이 폴더와 그 안의 `serve.json`은 `setup.sh`만 만듭니다(`docker-compose.override.yml`도 setup.sh가 다시 생성). 먼저 `docker compose up -d`로 사이드카를 다시 만들면 Docker가 빈 `tailscale/config/`를 root 소유로 만들고, serve 규칙이 없어 tailnet에서 :9119가 사라집니다. 그렇게 됐다면 `./setup.sh`를 실행하면 복구됩니다(그 폴더에 `serve.json`을 쓰고 사이드카에 반영). root가 아닌 사용자로 실행한다면 먼저 `sudo chown -R "$(id -u):$(id -g)" tailscale/config`가 필요하고, setup.sh가 이를 안내합니다. 예전 `tailscale/serve.json`은 지워도 됩니다.
 
+**다른 폴더에 예전 설치가 남아 있어도 그냥 새로 설치하면 됩니다.** 컨테이너 이름(`hermes`, `hermes-tailscale`, …)이 겹치면 setup.sh가 그것이 예전 hermes 설치인지 확인하고, 맞으면 그 컨테이너를 내린 뒤 새 폴더가 비어 있을 때만 `tailscale/state`(같은 tailnet 기기 유지)·`data`(세션·메모리)·`workspace`를 복사해 옵니다. 예전 폴더는 지우지 않으니 확인 후 직접 정리하세요. 겹치는 이름을 hermes가 아닌 다른 프로그램이 쓰고 있으면 아무것도 건드리지 않고 멈추며, 그때는 `.env`에 `HERMES_CONTAINER_NAME=hermes2`처럼 다른 이름을 넣으면 됩니다.
+
 ## 프로젝트
 
 각 머신의 **프로젝트 = 프로젝트 루트 바로 아래의 폴더 하나**입니다. 숨김 폴더는 제외됩니다. 작업 폴더 `./workspace`는 항상 첫 번째 루트이고, 그 자체도 `workspace`라는 프로젝트입니다.

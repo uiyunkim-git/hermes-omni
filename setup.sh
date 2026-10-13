@@ -450,6 +450,56 @@ esac
 docker compose config -q || die "compose 설정이 올바르지 않습니다."
 ((START)) || { log "준비 완료 (--no-start)."; exit 0; }
 
+# --- 이름이 겹치는 예전 설치 정리 ----------------------------------------------------------
+# 컨테이너 이름(hermes, hermes-tailscale, ...)은 고정이라 다른 폴더에 예전 설치가 남아 있으면 충돌한다.
+# 예전 hermes 설치(이 저장소의 다른 체크아웃)라면 그 컨테이너를 내리고, 새 폴더가 비어 있을 때만
+# Tailscale 노드 상태·Hermes 데이터·작업 폴더를 복사해 온다(예전 폴더는 그대로 둔다).
+# hermes 설치가 아닌 컨테이너는 건드리지 않고 멈춘다.
+is_old_install() {  # $1 = container name
+  local dir svc img
+  dir="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$1")"
+  svc="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$1")"
+  img="$(docker inspect -f '{{.Config.Image}}' "$1")"
+  if [[ -n "$dir" && -f "$dir/setup.sh" && -f "$dir/docker-compose.yml" ]]; then
+    grep -q 'hermes-agent' "$dir/docker-compose.yml"
+  else  # 폴더가 지워졌어도 서비스/이미지가 우리 것이면 예전 설치로 본다
+    [[ "$svc" =~ ^(hermes|tailscale|link|hub)$ && "$img" =~ (hermes-agent|tailscale/tailscale) ]]
+  fi
+}
+copy_into_empty() {  # $1 = 예전 경로, $2 = 새 경로 (비어 있을 때만; root 소유 파일도 복사되도록 컨테이너에서)
+  [[ -d "$1" ]] && [[ -n "$(ls -A "$1" 2>/dev/null)" ]] || return 0
+  mkdir -p "$2"
+  [[ -z "$(ls -A "$2" 2>/dev/null)" ]] || return 0
+  docker run --rm --entrypoint sh -v "$1:/from:ro" -v "$2:/to" "$(hermes_image)" -c 'cp -a /from/. /to/' \
+    && log "예전 설치에서 복사: $1 → $2" || warn "복사 실패: $1 → $2"
+}
+clear_name_conflicts() {
+  local project n cproj cdir
+  local -A old=()
+  project="$(docker compose config 2>/dev/null | sed -n 's/^name: //p' | head -n1)"
+  while IFS= read -r n; do
+    [[ -n "$n" ]] && docker inspect "$n" >/dev/null 2>&1 || continue
+    cproj="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$n")"
+    [[ -n "$cproj" && "$cproj" == "$project" ]] && continue   # 이 폴더의 컨테이너 — compose 가 처리
+    is_old_install "$n" \
+      || die "컨테이너 이름 '$n' 을(를) 다른 프로그램이 쓰고 있습니다. .env 에 HERMES_CONTAINER_NAME=hermes2 처럼 다른 이름을 넣고 다시 실행하세요."
+    old["${cproj:-$n}"]="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$n")"
+  done < <(docker compose config 2>/dev/null | sed -n 's/^ *container_name: //p' | tr -d "\"'")
+  for cproj in "${!old[@]}"; do
+    cdir="${old[$cproj]}"
+    warn "예전 설치(${cdir:-알 수 없는 폴더})의 컨테이너가 같은 이름을 쓰고 있어 내립니다. 그 폴더는 그대로 남습니다."
+    mapfile -t ids < <(docker ps -aq --filter "label=com.docker.compose.project=$cproj")
+    ((${#ids[@]})) || mapfile -t ids < <(docker ps -aq --filter "name=^${cproj}$")
+    ((${#ids[@]})) && docker rm -f "${ids[@]}" >/dev/null
+    if [[ -n "$cdir" && "$cdir" != "$PWD" ]]; then
+      copy_into_empty "$cdir/tailscale/state" "$PWD/tailscale/state"
+      copy_into_empty "$cdir/data" "$PWD/data"
+      copy_into_empty "$cdir/workspace" "$PWD/workspace"
+    fi
+  done
+}
+clear_name_conflicts
+
 # --- 실행 -------------------------------------------------------------------------------
 docker compose up -d --remove-orphans
 name="$(docker compose ps --format '{{.Name}}' hermes | head -n1)"
