@@ -29,6 +29,7 @@ services:
       - PYTHONPATH=/app
       - PYTHONUNBUFFERED=1
       - PYTHONDONTWRITEBYTECODE=1
+      - LD_LIBRARY_PATH=/usr/local/lib   # 수정된 SQLite 우선 (docker-compose.yml 참고)
     volumes:
       - ./omni:/app/omni:ro
       - ./omni-state/link:/state
@@ -45,6 +46,7 @@ services:
       - PYTHONPATH=/app
       - PYTHONUNBUFFERED=1
       - PYTHONDONTWRITEBYTECODE=1
+      - LD_LIBRARY_PATH=/usr/local/lib   # 수정된 SQLite 우선 (docker-compose.yml 참고)
     volumes:
       - ./omni:/app/omni:ro
       - ./omni-state/hub:/state
