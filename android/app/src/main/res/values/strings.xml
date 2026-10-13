@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string name="app_name" translatable="false">Hermes Omni</string>
+  <string name="error_detail" translatable="false">%1$s\n%2$s</string>
+
+  <string name="hub_dialog_title">허브 주소</string>
+  <string name="hub_dialog_message">Hermes Omni 허브 URL을 입력하세요.\n예: http://hub-이름.tailnet.ts.net</string>
+  <string name="hub_dialog_connect">연결</string>
+  <string name="hub_url_invalid">http:// 또는 https:// 주소를 입력하세요</string>
+  <string name="hub_warn_title">Tailscale 주소가 아닙니다</string>
+  <string name="hub_warn_message">%1$s 은(는) Tailscale(*.ts.net, 100.64.0.0/10)이나 LAN 주소가 아닙니다. 그래도 이 주소를 사용할까요?</string>
+  <string name="hub_warn_use">사용</string>
+
+  <string name="cancel">취소</string>
+
+  <string name="menu_change_hub">허브 URL 변경</string>
+  <string name="menu_reload">새로고침</string>
+  <string name="menu_clear_cookies">쿠키 삭제 (로그아웃)</string>
+  <string name="clear_cookies_message">로그인 쿠키와 저장된 웹 데이터를 삭제할까요?</string>
+  <string name="clear_cookies_confirm">삭제</string>
+  <string name="cookies_cleared">로그아웃했습니다</string>
+
+  <string name="error_title">허브에 연결할 수 없습니다</string>
+  <string name="error_hint">Tailscale 연결을 확인하세요</string>
+  <string name="error_retry">다시 시도</string>
+
+  <string name="copied">복사했습니다</string>
+  <string name="download_started">다운로드 중: %1$s</string>
+  <string name="download_failed">다운로드 실패: %1$s</string>
+  <string name="download_unsupported">이 다운로드 형식은 지원되지 않습니다</string>
+  <string name="no_app_for_link">이 링크를 열 앱이 없습니다</string>
+</resources>

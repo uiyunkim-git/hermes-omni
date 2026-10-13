@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <!-- Bars match the web UI's theme-color meta (dark). -->
+  <color name="bar_bg">#111317</color>
+  <color name="surface">#111317</color>
+  <color name="text_primary">#E8EAEE</color>
+  <color name="text_secondary">#9AA1AE</color>
+  <color name="accent">#8EA2FF</color>
+</resources>

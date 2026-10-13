@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The WebView is created in code and inserted at index 0 (so it can be rebuilt after a renderer crash). -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    tools:ignore="MergeRootFrame"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+  <ProgressBar
+      android:id="@+id/progress"
+      style="@android:style/Widget.Material.ProgressBar.Horizontal"
+      android:layout_width="match_parent"
+      android:layout_height="3dp"
+      android:layout_gravity="top"
+      android:indeterminate="false"
+      android:max="100"
+      android:progressTint="@color/accent"
+      android:progressBackgroundTint="@android:color/transparent"
+      android:visibility="gone" />
+
+  <LinearLayout
+      android:id="@+id/error_panel"
+      android:layout_width="match_parent"
+      android:layout_height="match_parent"
+      android:background="@color/surface"
+      android:clickable="true"
+      android:focusable="true"
+      android:gravity="center"
+      android:orientation="vertical"
+      android:padding="32dp"
+      android:visibility="gone">
+
+    <ImageView
+        android:layout_width="72dp"
+        android:layout_height="72dp"
+        android:layout_marginBottom="20dp"
+        android:alpha="0.85"
+        android:contentDescription="@null"
+        android:src="@drawable/ic_mark" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:text="@string/error_title"
+        android:textColor="@color/text_primary"
+        android:textSize="20sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:gravity="center"
+        android:text="@string/error_hint"
+        android:textColor="@color/text_primary"
+        android:textSize="16sp" />
+
+    <TextView
+        android:id="@+id/error_detail"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:gravity="center"
+        android:textColor="@color/text_secondary"
+        android:textIsSelectable="true"
+        android:textSize="13sp" />
+
+    <Button
+        android:id="@+id/error_retry"
+        style="@android:style/Widget.Material.Button.Colored"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:minWidth="160dp"
+        android:text="@string/error_retry" />
+
+    <Button
+        android:id="@+id/error_change_hub"
+        style="@android:style/Widget.Material.Button.Borderless.Colored"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="@string/menu_change_hub" />
+  </LinearLayout>
+</FrameLayout>

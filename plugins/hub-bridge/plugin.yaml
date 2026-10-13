@@ -1,0 +1,8 @@
+name: hub-bridge
+version: "0.1.0"
+description: "hermes-omni: message Hermes sessions on other projects and machines through the omni hub"
+author: hermes-omni
+provides_tools:
+  - hub_directory
+  - hub_send
+  - hub_inbox

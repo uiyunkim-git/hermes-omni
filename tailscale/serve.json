@@ -1,5 +1,0 @@
-{
-  "TCP": {
-    "9119": { "TCPForward": "hermes:9119" }
-  }
-}

@@ -9,12 +9,14 @@
 #  - 머신마다 다른 것(GPU, 작업 폴더 절대 경로, Tailscale 노드)은 setup.sh 가 생성하는
 #    docker-compose.override.yml 에 있다 (git 제외, compose 가 자동으로 읽음).
 #  - 모든 상태는 이 폴더 안: ./data (= /opt/data: config, 세션, 메모리, 스킬, 자동 생성 비밀값),
-#    ./workspace, ./tailscale/state
+#    ./workspace, ./tailscale/state, ./omni-state (link/hub 상태)
 #  - Docker: 호스트 docker.sock 패스스루 (= 호스트 root 권한). 소켓 GID 는 이미지가 자동으로 맞춤.
+#  - hermes-omni: link(모든 머신)·hub(hub 머신) 서비스는 compose.omni.yml 템플릿을 override 가 extends 로 붙인다.
 # =====================================================================================
 services:
   hermes:
-    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:latest}
+    # 검증된 빌드(v0.21.5 · 749220ef)에 고정. 일치하는 태그가 없어 digest 로 고정한다 (.env 의 HERMES_IMAGE 로 변경 가능).
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent@sha256:d4da4a40cd7a28aba983775d9fd31d94cbf153eeb0cb9e844d6d0f612b7c24db}
     container_name: ${HERMES_CONTAINER_NAME:-hermes}
     restart: unless-stopped
     command: ["gateway", "run"]

@@ -7,5 +7,11 @@ docker-compose.override.yml
 data/
 workspace/
 
-# Tailscale 노드 상태 (노드 키)
+# hermes-omni 상태 (link/hub 상태·토큰, hub DB, APK, 서명 키) — setup.sh·link·hub 가 생성
+omni-state/
+
+# Tailscale 노드 상태 (노드 키) + setup.sh 가 생성하는 serve 설정
 tailscale/state/
+tailscale/config/
+# (예전 위치 — 더 이상 쓰지 않음)
+tailscale/serve.json

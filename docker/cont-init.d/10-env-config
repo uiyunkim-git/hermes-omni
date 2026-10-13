@@ -20,6 +20,57 @@ if ! grep -q '^HERMES_DASHBOARD_BASIC_AUTH_SECRET=.' "$secrets" 2>/dev/null; the
     echo "[env-config] generated dashboard session signing secret"
 fi
 
+# hermes-omni: a machine running an omni link (OMNI_LINK_TOKEN set by the generated compose
+# override) needs the hub-bridge plugin enabled. `config set plugins.enabled` REPLACES the list,
+# so merge with the current one. Never removes anything; a plugins.disabled entry wins.
+# Runs regardless of HERMES_APPLY_ENV_CONFIG, which only governs the .env → config mapping below.
+enable_plugin() {
+    cfg="${HERMES_HOME:-/opt/data}/config.yaml"
+    # Exit codes: 0 = print merged JSON list, 10 = already enabled, 11 = explicitly disabled.
+    merged=$(/opt/hermes/.venv/bin/python - "$cfg" "$1" <<'PY'
+import json, os, sys
+import yaml
+path, name = sys.argv[1], sys.argv[2]
+cfg = {}
+if os.path.exists(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as e:
+        sys.exit(f"{path}: {' '.join(str(e).split())}")
+if not isinstance(cfg, dict):
+    sys.exit(f"{path}: top level is not a mapping")
+plugins = cfg.get("plugins") or {}
+if not isinstance(plugins, dict):
+    sys.exit(f"{path}: 'plugins' is not a mapping")
+disabled = plugins.get("disabled") or []
+if isinstance(disabled, list) and name in disabled:
+    sys.exit(11)
+enabled = plugins.get("enabled")
+if enabled is None:
+    enabled = []
+if not isinstance(enabled, list) or not all(isinstance(x, str) for x in enabled):
+    sys.exit(f"{path}: plugins.enabled is not a list of names: {enabled!r}")
+if name in enabled:
+    sys.exit(10)
+print(json.dumps(enabled + [name]))
+PY
+    )
+    case $? in
+        0)  if out=$(hermes config set plugins.enabled "$merged" 2>&1); then
+                echo "[env-config] plugins.enabled += $1 → $merged"
+            else
+                echo "[env-config] WARN: could not enable plugin $1: $out" >&2
+            fi ;;
+        10) echo "[env-config] plugin $1 already enabled" ;;
+        11) echo "[env-config] WARN: plugin $1 is in plugins.disabled; leaving it disabled" >&2 ;;
+        *)  echo "[env-config] WARN: could not read plugins from $cfg; $1 not enabled" >&2 ;;
+    esac
+}
+if [ -n "${OMNI_LINK_TOKEN:-}" ]; then
+    enable_plugin hub-bridge
+fi
+
 case "${HERMES_APPLY_ENV_CONFIG:-1}" in
     0|false|no) echo "[env-config] disabled (HERMES_APPLY_ENV_CONFIG=0)"; exit 0 ;;
 esac

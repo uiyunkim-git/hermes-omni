@@ -1,0 +1,58 @@
+# hermes-omni 서비스 템플릿 — 직접 `docker compose -f` 로 쓰지 않는다.
+# setup.sh 가 생성하는 docker-compose.override.yml 이 extends 로 불러와
+# 머신별 값(user, 프로젝트 루트 마운트, GPU, hub 포트 공개)을 덧붙인다.
+#
+#   link : 모든 머신. hermes(:9119) ⇄ hub WebSocket 중계 + hub-bridge 플러그인용 HTTP(:8810, compose 네트워크 전용)
+#   hub  : HERMES_ROLE=hub 인 머신 하나. 웹 UI/API/APK(:8800, tailnet 에는 serve.json 의 :80 으로 노출)
+#
+# 별도 이미지를 빌드하지 않는다: Hermes 이미지 안의 Python 3.13 (+aiohttp) 으로 ./omni 를 읽기 전용 마운트해 실행.
+# 상태는 ./omni-state/{link,hub} (git 제외). 환경값은 setup.sh 가 만드는 link.env / hub.env.
+x-omni-common: &omni-common
+  image: ${HERMES_IMAGE:-nousresearch/hermes-agent@sha256:d4da4a40cd7a28aba983775d9fd31d94cbf153eeb0cb9e844d6d0f612b7c24db}
+  restart: unless-stopped
+  init: true                    # python 이 PID 1 이면 SIGTERM 이 무시됨 → tini 로 정상 종료
+  working_dir: /app
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  link:
+    <<: *omni-common
+    container_name: ${HERMES_CONTAINER_NAME:-hermes}-link
+    entrypoint: ["/opt/hermes/.venv/bin/python", "-m", "omni.link"]
+    command: []
+    env_file:
+      - .env
+      - omni-state/link/link.env
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+    volumes:
+      - ./omni:/app/omni:ro
+      - ./omni-state/link:/state
+
+  hub:
+    <<: *omni-common
+    container_name: ${HERMES_CONTAINER_NAME:-hermes}-hub
+    entrypoint: ["/opt/hermes/.venv/bin/python", "-m", "omni.hub"]
+    command: []
+    env_file:
+      - .env
+      - omni-state/hub/hub.env
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+    volumes:
+      - ./omni:/app/omni:ro
+      - ./omni-state/hub:/state
+      - ./omni-state/apk:/apk:ro
+    healthcheck:
+      test: ["CMD", "/opt/hermes/.venv/bin/python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8800/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3

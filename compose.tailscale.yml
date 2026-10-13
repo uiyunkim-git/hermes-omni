@@ -1,8 +1,12 @@
-# Tailscale 사이드카 — 이 머신 전용 tailnet 노드(TS_HOSTNAME)를 띄우고 tailnet 에만 :9119 를 노출한다.
+# Tailscale 사이드카 — 이 머신 전용 tailnet 노드(TS_HOSTNAME)를 띄우고 tailnet 에만 포트를 노출한다.
 # 호스트의 tailscale 과 무관하다. userspace 모드라 /dev/net/tun·추가 권한이 필요 없다.
 # 노드 상태는 ./tailscale/state 에 저장되어 재시작·재부팅 후에도 로그인이 유지된다.
 # setup.sh 가 생성하는 docker-compose.override.yml 이 extends 로 불러와 노드 이름(hermes-<호스트명>)을 붙인다.
 # 첫 로그인: .env 의 TS_AUTHKEY, 또는 비워두면 로그에 나오는 로그인 URL (./setup.sh 가 보여줌).
+#
+# 노출 규칙: ./tailscale/config/serve.json (setup.sh 가 생성) — :9119 → hermes:9119, hub 머신은 :80 → hub:8800.
+#   파일이 아니라 폴더를 마운트해야 변경이 컨테이너에 inotify 로 전달되어 재시작 없이 반영된다.
+# SOCKS5 :1055 — compose 네트워크 안에서만 (포트 공개 안 함, 인증 없음). link 가 tailnet 의 hub 에 접속할 때 쓴다.
 services:
   tailscale:
     image: tailscale/tailscale:${TS_IMAGE_TAG:-stable}
@@ -16,7 +20,8 @@ services:
       - TS_USERSPACE=true
       - TS_AUTH_ONCE=true
       - TS_SERVE_CONFIG=/config/serve.json
+      - TS_SOCKS5_SERVER=:1055
       - TS_EXTRA_ARGS=${TS_EXTRA_ARGS:-}
     volumes:
       - ./tailscale/state:/var/lib/tailscale
-      - ./tailscale/serve.json:/config/serve.json:ro
+      - ./tailscale/config:/config:ro

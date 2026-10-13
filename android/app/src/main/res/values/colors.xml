@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <!-- Bars match the web UI's theme-color meta (light). -->
+  <color name="bar_bg">#F6F7F9</color>
+  <color name="surface">#F6F7F9</color>
+  <color name="text_primary">#15171C</color>
+  <color name="text_secondary">#5B6270</color>
+  <color name="accent">#4F6BED</color>
+  <color name="ic_launcher_bg">#1B1F3A</color>
+  <color name="ic_launcher_fg">#F2C14E</color>
+</resources>

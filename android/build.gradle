@@ -1,0 +1,2 @@
+// Built by scripts/build-apk.sh (docker: ghcr.io/cirruslabs/android-sdk:35 + Gradle 8.10.2).
+plugins { id "com.android.application" version "8.7.3" apply false }

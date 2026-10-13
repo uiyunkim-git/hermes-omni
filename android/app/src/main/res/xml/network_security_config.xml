@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The hub is served over plain HTTP on the tailnet (Tailscale HTTPS certs are not enabled), and
+     domain-config cannot express CIDRs such as 100.64.0.0/10, so cleartext is permitted globally.
+     The app only ever loads the configured hub origin in-app; everything else opens externally. -->
+<network-security-config xmlns:tools="http://schemas.android.com/tools">
+  <base-config cleartextTrafficPermitted="true" tools:ignore="InsecureBaseConfiguration">
+    <trust-anchors>
+      <certificates src="system" />
+    </trust-anchors>
+  </base-config>
+</network-security-config>

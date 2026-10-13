@@ -1,0 +1,58 @@
+// Hermes Omni WebView shell. Version and default hub URL are injected by scripts/build-apk.sh:
+//   -PomniVersionCode=<yymmddHH> -PomniVersionName=0.1.<code> -PomniHubUrl=<url>
+// Release signing comes from the environment (OMNI_KS_FILE / OMNI_KS_PASS / OMNI_KS_ALIAS);
+// without OMNI_KS_FILE the release APK is left unsigned.
+plugins { id "com.android.application" }
+
+def omniVersionCode = (project.findProperty("omniVersionCode") ?: "1") as int
+def omniVersionName = (project.findProperty("omniVersionName") ?: "0.1.0-dev") as String
+def omniHubUrl = (project.findProperty("omniHubUrl") ?: "") as String
+def ksFile = System.getenv("OMNI_KS_FILE")
+
+static String javaString(String s) {
+  return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
+}
+
+android {
+  namespace "net.hermesomni.app"
+  compileSdk 35
+  buildToolsVersion "35.0.0"
+  buildFeatures { buildConfig true }
+
+  defaultConfig {
+    applicationId "net.hermesomni.app"
+    minSdk 26
+    targetSdk 35
+    versionCode omniVersionCode
+    versionName omniVersionName
+    buildConfigField "String", "DEFAULT_HUB_URL", javaString(omniHubUrl)
+  }
+
+  signingConfigs {
+    if (ksFile) {
+      release {
+        storeFile file(ksFile)
+        storePassword System.getenv("OMNI_KS_PASS")
+        keyAlias System.getenv("OMNI_KS_ALIAS") ?: "hermes-omni"
+        keyPassword System.getenv("OMNI_KS_PASS")
+      }
+    }
+  }
+
+  buildTypes {
+    release {
+      minifyEnabled false
+      if (ksFile) signingConfig signingConfigs.release
+    }
+  }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
+  }
+
+  // No Play-store dependency metadata blob in the APK (there are no dependencies anyway).
+  dependenciesInfo { includeInApk false; includeInBundle false }
+}
+
+tasks.withType(JavaCompile).configureEach { options.compilerArgs += ["-Xlint:deprecation", "-Xlint:unchecked"] }

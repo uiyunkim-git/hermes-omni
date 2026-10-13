@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+  <!-- Base differs per night mode (values-night/themes.xml); WebView derives
+       prefers-color-scheme from the resulting android:isLightTheme. -->
+  <style name="Base.AppTheme" parent="android:Theme.Material.Light" />
+
+  <style name="AppTheme" parent="Base.AppTheme">
+    <item name="android:colorPrimary">@color/bar_bg</item>
+    <item name="android:colorPrimaryDark">@color/bar_bg</item>
+    <item name="android:colorAccent">@color/accent</item>
+    <item name="android:windowBackground">@color/surface</item>
+    <item name="android:statusBarColor">@color/bar_bg</item>
+    <item name="android:navigationBarColor">@color/bar_bg</item>
+    <item name="android:windowLightStatusBar">@bool/light_bars</item>
+    <item name="android:windowLightNavigationBar" tools:targetApi="27">@bool/light_bars</item>
+    <item name="android:actionBarStyle">@style/AppTheme.ActionBar</item>
+    <!-- Android 15 enforces edge-to-edge at targetSdk 35; keep classic insets for the WebView. -->
+    <item name="android:windowOptOutEdgeToEdgeEnforcement" tools:targetApi="35">true</item>
+  </style>
+
+  <style name="AppTheme.ActionBar" parent="android:Widget.Material.ActionBar.Solid">
+    <item name="android:background">@color/bar_bg</item>
+    <item name="android:elevation">0dp</item>
+    <item name="android:titleTextStyle">@style/AppTheme.ActionBar.Title</item>
+  </style>
+
+  <style name="AppTheme.ActionBar.Title" parent="android:TextAppearance.Material.Widget.ActionBar.Title">
+    <item name="android:textColor">@color/text_primary</item>
+    <item name="android:textSize">17sp</item>
+  </style>
+</resources>
