@@ -243,11 +243,41 @@ export function firstLine(s, n = 80) {
   return truncate(line, n);
 }
 
+// A GFM table delimiter row: "|---|:--:|", "--- | ---".
+const TABLE_SEP_RE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
+const TABLE_ROW_RE = /^\s*\|.*\|\s*$/;
+// The same delimiter inside text whose newlines were already folded (hub previews): "|---|---|".
+const INLINE_SEP_RE = /(?:\|\s*:?-{3,}:?\s*)+\|/g;
+
+const tableCells = (l) => l.replace(/\\\|/g, '\u0000').split('|').map((c) => c.replace(/\u0000/g, '|').trim()).filter(Boolean);
+
+/** Table rows as "a · b" (delimiter rows dropped), so a one-line preview never shows pipes. */
+function flattenTables(s) {
+  const lines = s.split('\n');
+  const hasTable = lines.some((l) => l.includes('-') && TABLE_SEP_RE.test(l));
+  let out = s;
+  if (hasTable || lines.some((l) => TABLE_ROW_RE.test(l))) {
+    const kept = [];
+    for (const l of lines) {
+      if (hasTable && l.includes('-') && TABLE_SEP_RE.test(l)) continue;
+      if (!TABLE_ROW_RE.test(l) && !(hasTable && l.includes('|'))) { kept.push(l); continue; }
+      const cells = tableCells(l);
+      if (cells.length) kept.push(cells.join(' · '));
+    }
+    out = kept.join('\n');
+  }
+  INLINE_SEP_RE.lastIndex = 0;
+  if (!INLINE_SEP_RE.test(out)) return out;
+  // Folded table: "Result. | | a | b | |---|---| | 1 | 2 |" → "Result. a · b · 1 · 2".
+  const flat = out.replace(INLINE_SEP_RE, '|').replace(/\s*(?:\|\s*)+/g, ' · ').replace(/^ · | · $/g, '');
+  // The prose before the table ends a sentence: no separator after it.
+  return flat.replace(/([.:!?。](?:\*\*|__)?) · /, '$1 ');
+}
+
 /** Plain one-line text from markdown-ish content (row previews). */
 export function stripMd(s) {
   if (typeof s !== 'string') return '';
-  return s
-    .replace(/```[\s\S]*?(```|$)/g, ' ')
+  return flattenTables(s.replace(/```[\s\S]*?(```|$)/g, ' '))
     .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
     .replace(/(\*\*|__|\*|`|~~)/g, '')
     .replace(/^\s{0,3}(#{1,6}\s+|>\s?|[-*+]\s+|\d+\.\s+)/gm, '')
@@ -334,11 +364,18 @@ const TURN_NOTICES = new Map([
     { partial: true, text: '끝까지 처리되지 않았어요 · 일부 작업은 이미 실행됐을 수 있어요' }],
 ]);
 
+// The row Hermes appends when a turn is cut off after a tool result (agent/message_sanitization.py
+// close_interrupted_tool_sequence: "Operation interrupted.") and its interrupt_text family
+// ("Operation interrupted: waiting for model response (…)", "Operation interrupted during retry (…)").
+const INTERRUPTED_RE = /^Operation interrupted(?:\.$|:\s|\s+during\s)/;
+const INTERRUPTED = { partial: true, interrupted: true, text: '중단됨' };
+
 /** Korean copy for a Hermes failed-turn boundary row, or null for real assistant text. */
 export function turnNotice(text, displayKind) {
   const s = typeof text === 'string' ? text.trim() : '';
   const known = TURN_NOTICES.get(s);
   if (known) return known;
+  if (s.length <= 400 && !s.includes('\n') && INTERRUPTED_RE.test(s)) return INTERRUPTED;
   return displayKind === 'failed_turn' ? { partial: false, text: '이 요청은 처리되지 않았어요' } : null;
 }
 

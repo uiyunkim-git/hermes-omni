@@ -635,6 +635,7 @@ select.input { appearance: none; -webkit-appearance: none; padding-right: 34px; 
 .sys-k { color: var(--text-3); }
 .sys-v { color: var(--text-2); font-feature-settings: "tnum"; }
 .activity { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 13px; line-height: 18px; color: var(--text-3); font-feature-settings: "tnum"; }
+.activity.quiet > .spinner { visibility: hidden; animation: none; }
 
 /* bottom: pill, dock, composer */
 .chat-bottom { flex: none; position: relative; background: var(--bg); z-index: 2; }

@@ -306,13 +306,14 @@ async def search(request: web.Request) -> web.Response:
             continue
         for r in rows:
             sid = r.get("stored_id")
-            if not isinstance(sid, str):
+            if not isinstance(sid, str) or hub.index.hidden_quiet(node, sid, bool(r.get("hidden"))):
                 continue
             row = hub.index.get(node, sid) or {}
             title = r.get("title") or (row_title(row) if row else None)
             results.append({"node": node, "node_name": hub.index.node_name(node), "stored_id": sid,
                             "key": session_key(node, sid), "title": title, "snippet": r.get("snippet") or "", "highlights": r.get("highlights") or [],
-                            "role": r.get("role"), "last_active": r.get("last_active") or row.get("last_active"),
+                            "role": r.get("role"), "tool": bool(r.get("tool")),
+                            "last_active": r.get("last_active") or row.get("last_active"),
                             "folder": row.get("folder")})
     results.sort(key=lambda x: x.get("last_active") or 0, reverse=True)
     return web.json_response({"results": results[:limit], "partial": sorted(partial)})

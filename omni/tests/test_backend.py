@@ -162,6 +162,35 @@ class LinkIndexTests(unittest.TestCase):
         self.assertNotIn("⟦omni", text)
         self.assertEqual([text[a:b] for a, b in hl], ["6543", "orbit"])
 
+    def test_search_snippet_cleanup(self) -> None:
+        from omni.link.agent import search_hit_is_noise, search_snippet, text_snippet, tool_call_text
+        # Encoded tool-call arguments: escapes decoded, the closing quote/braces dropped.
+        raw = r'...items[i + 1]})\\n except >>>IndexError<<<:\\n print(i, \\\"-> x\\\")\"}"}}]'
+        self.assertTrue(search_hit_is_noise("assistant", raw))
+        text, hl = search_snippet(raw)
+        self.assertEqual(text, '…items[i + 1]}) except IndexError: print(i, "-> x")')
+        self.assertEqual([text[a:b] for a, b in hl], ["IndexError"])
+        # Markdown table, rule and emphasis syntax.
+        text, hl = search_snippet("...| | `GET /items/9` | `items[10]` | `>>>IndexError<<<` → 500 |\n"
+                                  "|---|:---:|---|\n**원인** ...")
+        self.assertEqual(text, "…GET /items/9 · items[10] · IndexError → 500 · 원인…")
+        self.assertEqual([text[a:b] for a, b in hl], ["IndexError"])
+        self.assertEqual(search_snippet("cat a | grep >>>foo<<< || true")[0], "cat a | grep foo || true")
+        # The first match is moved near the start (the UI clamps snippets to two lines).
+        long = "...앞부분 " + "가나다라마바사아자차 " * 8 + "끝에서 >>>IndexError<<<가 납니다..."
+        text, hl = search_snippet(long)
+        self.assertTrue(text.startswith("…") and text.endswith("…"))
+        self.assertLessEqual(hl[0][0], 30)
+        self.assertEqual(text[hl[0][0]:hl[0][1]], "IndexError")
+        text, hl = text_snippet("## 제목\n\n" + "가나다라마 " * 20 + "**IndexError** 발생", ["indexerror"])
+        self.assertLessEqual(hl[0][0], 30)
+        self.assertNotIn("**", text)
+        # Tool-call arguments decoded for the fallback excerpt.
+        calls = ('[{"function": {"name": "terminal", "arguments": '
+                 '"{\\"command\\": \\"python3 - <<PY\\\\nexcept IndexError: pass\\\\nPY\\"}"}}]')
+        self.assertEqual(tool_call_text(calls), "python3 - <<PY\nexcept IndexError: pass\nPY")
+        self.assertEqual(tool_call_text([{"function": {"arguments": {"path": "/a", "n": 3}}}]), "/a")
+
 
 class QueueResubmitTests(unittest.TestCase):
     """Prompts Hermes dropped from its queue (중단 clears it) are submitted again, never lost silently."""
@@ -365,6 +394,21 @@ class RouterResolveTests(unittest.TestCase):
         e = self.reason("Plann3r")
         self.assertEqual(e.reason, "unknown_target")
         self.assertIn("suggestions", e.extra)
+
+    def test_hidden_rows_in_lists(self) -> None:
+        index = self.router.index
+        self.assertNotIn("a3", {r["stored_id"] for r in index.hub_rows()})
+        self.assertEqual(index.search("Bot Chat"), [])                       # browser title search
+        self.assertTrue(index.hidden_quiet("alpha", "a3"))                   # browser content search
+        self.assertFalse(index.hidden_quiet("alpha", "a1"))
+        self.assertTrue(index.hidden_quiet("alpha", "zz", hidden=True))     # unknown row: link's flag
+        self.assertEqual([r["stored_id"] for r in index.search("Bot Chat", include_hidden=True)], ["a3"])
+        index.links.is_online = lambda n: True  # type: ignore[method-assign]
+        index.rows["alpha"]["a3"]["running"] = True                         # running: listed again
+        self.assertIn("a3", {r["stored_id"] for r in index.hub_rows()})
+        self.assertEqual([r["stored_id"] for r in index.search("Bot Chat")], ["a3"])
+        self.assertFalse(index.hidden_quiet("alpha", "a3"))
+        self.assertEqual(index.search("Bot Chat", include_hidden=False), [])  # never an agent target
 
     def test_self(self) -> None:
         self.assertEqual(self.reason("Planner").reason, "self")

@@ -14,7 +14,7 @@ import { socket } from '../ws.js';
 import { navigate, back } from '../router.js';
 import {
   h, contentText, copyText, debounce, download, fmtClock, fmtDateTime, fmtInt, isDesktop, rafThrottle,
-  sessionHref, ss, toMs, parseJsonMaybe, relTime, fill, add, steerText, isSteerRow, turnNotice,
+  sessionHref, ss, ls, toMs, parseJsonMaybe, relTime, fill, add, steerText, isSteerRow, turnNotice,
 } from '../util.js';
 import { icon } from '../ui/icons.js';
 import { banner, iconButton, spinner, errorLine, skeletonLines } from '../ui/controls.js';
@@ -238,8 +238,12 @@ export function mountChat(root, { node, sid }) {
         const recs = live.segs.filter((s) => s.kind === 'request' && s.state === 'done');
         if (recs.length) {
           const turns = buildTurns(rows);
-          const last = turns[turns.length - 1];
-          if (last) turnNotes.set(last.key, [...(turnNotes.get(last.key) || []), ...recs.map((s) => ({ ...s, key: `rq:${s.request_id}` }))]);
+          // Each record joins the turn holding the call it guarded (a reply may have started a newer one).
+          const holder = (id) => (id ? turns.find((t) => t.rows.some((r) => Array.isArray(r.tool_calls) && r.tool_calls.some((c) => String(c?.id) === String(id)))) : null);
+          for (const s of recs) {
+            const t = holder(s.afterTool) || turns[turns.length - 1];
+            if (t) turnNotes.set(t.key, [...(turnNotes.get(t.key) || []), { ...s, key: `rq:${s.request_id}` }]);
+          }
         }
         live = null;
         liveCache.clear();
@@ -446,6 +450,24 @@ export function mountChat(root, { node, sid }) {
   }
   let renderedDup = '';
 
+  /** A turn's notes plus request records this device remembers for its calls (after a reload). */
+  function withRecalled(t, notes) {
+    const memo = recalled();
+    let out = notes;
+    for (const r of t.rows) {
+      if (!Array.isArray(r.tool_calls)) continue;
+      for (const c of r.tool_calls) {
+        const id = c?.id ? String(c.id) : '';
+        const rec = id && memo[id];
+        if (!rec || out.some((n) => n.kind === 'request' && String(n.afterTool || '') === id)) continue;
+        if (live?.segs.some((s) => s.kind === 'request' && String(s.afterTool || '') === id)) continue;
+        if (out === notes) out = [...notes];
+        out.push({ kind: 'request', key: `rm:${id}`, state: 'done', afterTool: id, record: { ok: rec.ok, text: rec.text, via: rec.via } });
+      }
+    }
+    return out;
+  }
+
   function renderTurns() {
     const turns = buildTurns(visibleRows());
     const c = ctx();
@@ -468,7 +490,7 @@ export function mountChat(root, { node, sid }) {
     const locals = [...localItems];
     turns.forEach((t, i) => {
       const isLast = i === turns.length - 1;
-      const notes = turnNotes.get(t.key) || [];
+      const notes = withRecalled(t, turnNotes.get(t.key) || []);
       const replyHint = t.rows.some((r) => Array.isArray(r.tool_calls) && JSON.stringify(r.tool_calls).includes('hub_send')) ? `|${rows.filter((r) => r.omni?.kind === 'reply').length}|${incoming.length}` : '';
       const sig = `${turnSignature(t)}#${notes.map((n) => n.key).join(',')}${replyHint}${isLast ? lastSig : ''}`;
       let cached = turnCache.get(t.key);
@@ -555,6 +577,9 @@ export function mountChat(root, { node, sid }) {
     renderSegments(liveAsst, liveSegments(), liveCache, ctx());
     const showActivity = !live.done && running && requests.size === 0;
     activityEl.hidden = !showActivity;
+    // One spinner at a time: while a reasoning or tool line spins, the timer line is plain text.
+    activityEl.classList.toggle('quiet', showActivity && live.segs.some((s) => (s.kind === 'reasoning' && s.live)
+      || (s.kind === 'call' && (s.call.state === 'running' || s.call.state === 'generating'))));
     if (showActivity) {
       const since = live.startedAt || turnStartedAt || Date.now();
       activityEl.lastChild.textContent = `작업 중 · ${fmtClock((Date.now() - since) / 1000)}`;
@@ -691,17 +716,16 @@ export function mountChat(root, { node, sid }) {
         let text = typeof p.text === 'string' ? p.text : '';
         // Hermes' failed-turn boundary is not an answer: the 중단됨 note below says it (or the Korean copy).
         const notice = turnNotice(text);
-        if (notice) {
-          text = '';
-          if (p.status !== 'interrupted') live.segs.push({ kind: 'note', key: `ln${++segSeq}`, text: notice.text });
-        }
+        if (notice) text = '';
+        const interrupted = p.status === 'interrupted' || !!notice?.interrupted;
+        if (notice && !interrupted) live.segs.push({ kind: 'note', key: `ln${++segSeq}`, text: notice.text });
         if (text && !live.segs.some((s) => s.kind === 'text')) live.segs.push({ kind: 'text', key: `lx${++segSeq}`, text });
         live.done = true;
-        live.status = p.status || 'complete';
+        live.status = interrupted ? 'interrupted' : (p.status || 'complete');
         // Calls still open when the turn ends have no result: never mark them ✓.
         for (const s of live.segs) if (s.kind === 'call' && (s.call.state === 'running' || s.call.state === 'generating')) s.call.state = 'unknown';
-        if (live.status === 'interrupted') live.segs.push({ kind: 'note', key: `ln${++segSeq}`, text: '중단됨' });
-        else if (!text && !hasTextAfterLastCall() && !live.segs.some((s) => s.kind === 'error')) live.segs.push({ kind: 'note', key: `ln${++segSeq}`, text: EMPTY_REPLY });
+        if (interrupted) live.segs.push({ kind: 'note', key: `ln${++segSeq}`, text: '중단됨' });
+        else if (!notice && !text && !hasTextAfterLastCall() && !live.segs.some((s) => s.kind === 'error')) live.segs.push({ kind: 'note', key: `ln${++segSeq}`, text: EMPTY_REPLY });
         break;
       }
       case 'error':
@@ -768,21 +792,74 @@ export function mountChat(root, { node, sid }) {
   function addRequestPlaceholder(rid) {
     if (live && !live.done) {
       if (!live.segs.some((s) => s.kind === 'request' && s.request_id === rid)) {
-        // Remember the call it guards: the record line stays next to it once the turn is history.
-        let afterTool;
-        for (let i = live.segs.length - 1; i >= 0 && afterTool === undefined; i -= 1) if (live.segs[i].kind === 'call') afterTool = live.segs[i].call.tool_id || null;
-        live.segs.push({ kind: 'request', key: `q:${rid}`, request_id: rid, method: requests.get(rid)?.method, state: 'pending', afterTool: afterTool || undefined });
+        // The line goes right after the call it guards (not after later parallel calls or prose),
+        // and remembers it: the record stays next to that call once the turn is history.
+        const req = requests.get(rid);
+        const at = guardedCallIndex(req);
+        const seg = { kind: 'request', key: `q:${rid}`, request_id: rid, method: req?.method, state: 'pending', afterTool: at >= 0 ? live.segs[at].call.tool_id || undefined : undefined };
+        if (at >= 0) live.segs.splice(at + 1, 0, seg);
+        else live.segs.push(seg);
       }
     } else if (!localItems.some((x) => x.request_id === rid)) {
       localItems.push({ id: `q:${rid}`, kind: 'request', request_id: rid, method: requests.get(rid)?.method, afterId: Infinity });
     }
   }
 
+  /**
+   * Index in live.segs of the call a request guards. Hermes' request names no tool call id, and
+   * parallel calls start together, so: a running call of the named tool (or whose arguments hold
+   * the command), else the newest running call, else the newest call with an id. -1: none.
+   */
+  function guardedCallIndex(req) {
+    const params = req?.params || {};
+    const tool = typeof params.tool_name === 'string' ? params.tool_name : '';
+    const cmd = typeof params.command === 'string' ? params.command.trim().slice(0, 60) : '';
+    const argText = (c) => (typeof c.args === 'string' ? c.args : JSON.stringify(c.args ?? ''));
+    let byTool = -1;
+    let byCmd = -1;
+    let running = -1;
+    let any = -1;
+    for (let i = live.segs.length - 1; i >= 0; i -= 1) {
+      const s = live.segs[i];
+      if (s.kind !== 'call' || !s.call.tool_id) continue;
+      if (any < 0) any = i;
+      if (s.call.state !== 'running') continue;
+      if (running < 0) running = i;
+      if (byTool < 0 && tool && s.call.name === tool) byTool = i;
+      if (byCmd < 0 && cmd.length >= 4) {
+        const a = argText(s.call);
+        if (a.includes(cmd) || a.includes(JSON.stringify(cmd).slice(1, -1))) byCmd = i;
+      }
+    }
+    return [byCmd, byTool, running, any].find((i) => i >= 0) ?? -1;
+  }
+
+  // Answered request records live on this device only; remember them by tool call id so a
+  // reload still shows "승인함 · 한 번" under the call (bounded, every storage call may fail).
+  const RQ_KEY = 'omni.rq.v1';
+  function rememberRecord(toolId, record) {
+    if (!toolId || !record) return;
+    const m = ls.json(RQ_KEY, {}) || {};
+    m[toolId] = { ok: record.ok !== false, text: record.text || '', via: record.via || undefined, at: Date.now() };
+    const keys = Object.keys(m);
+    if (keys.length > 300) keys.sort((a, b) => (m[a].at || 0) - (m[b].at || 0)).slice(0, keys.length - 300).forEach((k) => delete m[k]);
+    ls.setJson(RQ_KEY, m);
+  }
+  let rqMemo = null;
+  const recalled = () => { if (!rqMemo) rqMemo = ls.json(RQ_KEY, {}) || {}; return rqMemo; };
+
   function resolveRequest(rid, record) {
     requests.delete(rid);
     const rec = { state: 'done', record };
     records.set(rid, rec);
-    if (live) for (const s of live.segs) if (s.kind === 'request' && s.request_id === rid) { s.state = 'done'; s.record = rec.record; }
+    if (live) {
+      for (const s of live.segs) {
+        if (s.kind !== 'request' || s.request_id !== rid) continue;
+        s.state = 'done';
+        s.record = rec.record;
+        if (s.afterTool) { rememberRecord(String(s.afterTool), rec.record); rqMemo = null; }
+      }
+    }
     renderDock();
     refreshHeader();
     renderAll();

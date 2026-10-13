@@ -195,27 +195,42 @@ class SessionIndex:
                     r.get("cwd") and (r["cwd"] == folder or r["cwd"].startswith(folder.rstrip("/") + "/"))):
                 continue
             hr = self.hub_row(n, r)
-            # Hermes-internal hidden sessions (e.g. the Bot Mode "Bot Chat") stay out of the list
-            # unless they need the user right now.
-            if r.get("hidden") and not hr.get("running") and not hr.get("pending_requests"):
+            if not self.listed(hr):
                 continue
             out.append(hr)
         out.sort(key=lambda r: r.get("last_active") or 0, reverse=True)
         return out
+
+    @staticmethod
+    def listed(hr: dict[str, Any]) -> bool:
+        """Whether a hub row belongs in the user's lists and searches: Hermes-internal hidden
+        sessions (e.g. the Bot Mode "Bot Chat") stay out unless they need the user right now."""
+        return not hr.get("hidden") or bool(hr.get("running")) or bool(hr.get("pending_requests"))
+
+    def hidden_quiet(self, node: str, sid: str, hidden: bool = False) -> bool:
+        """True for a hidden session (per the index, or ``hidden`` as the link reported it) that is
+        neither running nor waiting on the user: kept out of the browser's search results."""
+        row = self.get(node, sid)
+        if row is None:
+            return hidden
+        return not self.listed(self.hub_row(node, row))
 
     def attention(self, rows: list[dict[str, Any]] | None = None) -> int:
         rows = rows if rows is not None else self.hub_rows()
         return sum(1 for r in rows if r.get("node_online") and self.needs_you(r))
 
     def search(self, q: str, node: str | None = None, limit: int = 8, exclude: Key | None = None,
-               include_hidden: bool = True) -> list[dict[str, Any]]:
+               include_hidden: bool | None = None) -> list[dict[str, Any]]:
+        """Rows matching ``q`` by title/folder/node, best first. ``include_hidden``: True keeps
+        hidden rows, False drops them, None (the browser lists) keeps them only while ``listed``."""
         scored = []
         for n, r in self.all_rows():
             if node and n != node:
                 continue
             if exclude and (n, r["stored_id"]) == exclude:
                 continue
-            if not include_hidden and r.get("hidden"):
+            if r.get("hidden") and (include_hidden is False or (
+                    include_hidden is None and not self.listed(self.hub_row(n, r)))):
                 continue
             s = score(r, q, self.node_name(n))
             if s > 0:

@@ -201,6 +201,39 @@ export function settledRecord(record, tool) {
   return { ok: true, text: `${record.via} 허용함` };
 }
 
+/**
+ * What a call's persisted result says about its approval: Hermes' terminal tool adds
+ * `approval: "Command required approval (…) and was approved by the user."` (or "auto-approved
+ * by smart approval"). Null when the result says nothing (a denial shows as the call's 거부됨).
+ */
+export function approvalNote(tool) {
+  const p = tool?.preview;
+  const o = parseJsonMaybe(p);
+  // A long result may arrive trimmed (not JSON): read the field from the text then.
+  const a = o ? (typeof o.approval === 'string' ? o.approval : '')
+    : typeof p === 'string' ? (/"approval"\s*:\s*"([^"]{0,600})/.exec(p)?.[1] || '') : '';
+  if (/approved by the user/i.test(a)) return '승인함';
+  if (/auto-approved/i.test(a)) return '자동 승인됨';
+  return null;
+}
+
+/**
+ * History segments with a "승인함" line after each call whose result records an approval, unless
+ * this device already has the request record for that call (it says more: 한 번 / 이 세션 동안).
+ */
+export function withApprovalNotes(segs, notes = []) {
+  const anchored = notes.filter((n) => n.kind === 'request' && n.afterTool).map((n) => String(n.afterTool));
+  const covered = (id) => anchored.some((a) => id === a || id.startsWith(`${a}.`));
+  const out = [];
+  for (const s of segs) {
+    out.push(s);
+    if (s.kind !== 'tool' || s.tool.state === 'running' || s.tool.state === 'generating') continue;
+    const text = approvalNote(s.tool);
+    if (text && !covered(String(s.tool.id))) out.push({ kind: 'note', key: `ap:${s.tool.id}`, icon: 'check', text });
+  }
+  return out;
+}
+
 /** Inline placeholder text for a docked request (spec §3.4.3). */
 export function waitingText(method) {
   if (method === 'clarify') return '답변을 기다리는 중';
@@ -381,6 +414,7 @@ export function renderTurn(t, ctx, notes = [], o = {}) {
   if (!o.open && t.user && endsEmpty(t.rows) && !ended) {
     segs.push({ kind: 'note', key: `e:${t.key}`, text: EMPTY_REPLY });
   }
+  segs = withApprovalNotes(segs, notes);
   for (const n of notes) {
     // A request record goes right after the call it guarded, not after the turn's answer.
     let at = -1;

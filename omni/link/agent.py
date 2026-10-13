@@ -38,12 +38,31 @@ SEARCH_LIMIT_MAX = 50
 SEARCH_RESNIP_ROWS = 300       # transcript rows scanned to re-snip a noisy full-text hit
 SEARCH_RESNIP_TIMEOUT_S = 2.5  # within the hub's per-node search timeout
 SEARCH_RESNIP_PARALLEL = 6
-SNIPPET_BEFORE = 40
+# Display columns (CJK counts 2) kept before the first match. The UI clamps a snippet to two
+# lines (about 26 Hangul / 48 Latin characters each on a phone), so the match must start early.
+SNIPPET_LEAD = 36
 SNIPPET_AFTER = 140
 _HL_RE = re.compile(r">>>(.*?)<<<", re.S)
 _WS_RE = re.compile(r"\s+")
+# Highlight sentinels (private use code points) carried through snippet cleaning.
+_HL_ON, _HL_OFF = "\ue000", "\ue001"
 # A JSON object key, plain or escaped inside a JSON string ("path": / \"path\":): tool-call arguments.
 _JSON_KEY_RE = re.compile(r'\\?"[A-Za-z_][A-Za-z0-9_]*\\?"\s*:')
+# Escapes of JSON-encoded text (tool-call arguments are stored encoded, sometimes twice).
+_JSON_ESC_RE = re.compile(r'\\+[nrt]|\\+"')
+# The closing quote and braces of an encoded argument object at the end of a snippet ("}"}}]).
+_JSON_TAIL_RE = re.compile(r'\s*"\s*[}\]][\s"}\],]*$')
+# Markdown syntax that reads as noise once a message is flattened to one line.
+_MD_FENCE_RE = re.compile(r"```[\w+-]*")
+_MD_RULE_RE = re.compile(r"\|?(?:[ \t]*:?-{3,}:?[ \t]*\|)+(?:[ \t]*:?-{3,}:?)?|(?<!\S)[-=*_]{3,}(?!\S)")
+_MD_EMPH_RE = re.compile(r"\*\*|__|~~|`")
+_MD_HEADING_RE = re.compile(r"(?:^|(?<=[\n\r]))[ \t]*#{1,6}[ \t]|(?<=\s)#{2,6}[ \t]")
+_MD_CELL_RE = re.compile(r"(?<!\|)\|(?!\|)")
+_MD_PIPES_RE = re.compile(r"(?:\s*(?<!\|)\|(?!\|))+\s*")
+_EDGE_SEP_RE = re.compile(r"^[\s·]+|[\s·]+$")
+# Characters that take two columns.
+_WIDE_RE = re.compile("[\u1100-\u115f\u2e80-\u303e\u3041-\u33ff\u3400-\u4dbf\u4e00-\u9fff\ua960-\ua97f"
+                      "\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6]")
 # Hangul, kana and CJK ideographs: Hermes searches these by substring, not by FTS word prefix.
 _CJK_RE = re.compile("[\u1100-\u11ff\u3040-\u30ff\u3130-\u318f\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7a3]")
 # Text of omni delivery rows that is not the message itself (header line, instruction tails).
@@ -83,35 +102,80 @@ def _term_pattern(terms: list[str]) -> re.Pattern[str] | None:
 def search_snippet(raw: Any, terms: list[str] | None = None) -> tuple[str, list[list[int]]]:
     """Hermes FTS snippet (``>>>hit<<<`` markers) → one line of plain text + highlight ranges
     [start, end). Omni delivery markers are removed so they never reach the UI. Snippets from
-    Hermes' substring routes carry no markers; their ranges come from ``terms``."""
+    Hermes' substring routes carry no markers; their ranges come from ``terms``. The text is
+    cleaned like ``plain_snippet`` and cut so that the first match sits near its start."""
     text = raw if isinstance(raw, str) else ""
-    pieces: list[tuple[str, bool]] = []
-    pos = 0
-    for m in _HL_RE.finditer(text):
-        pieces += [(text[pos:m.start()], False), (m.group(1), True)]
-        pos = m.end()
-    pieces.append((text[pos:], False))
-    out: list[str] = []
+    text = MARKER_RE.sub("", text.replace(_HL_ON, "").replace(_HL_OFF, ""))
+    text = _HL_RE.sub(lambda m: _HL_ON + m.group(1) + _HL_OFF, text).replace(">>>", "").replace("<<<", "")
+    text = text.strip()
+    head, tail = text.startswith("..."), text.endswith("...")
+    text = text[3 if head else 0:len(text) - (3 if tail else 0)]
+    plain_parts: list[str] = []
     ranges: list[list[int]] = []
-    n = 0
-    for i, (piece, hit) in enumerate(pieces):
-        piece = _WS_RE.sub(" ", MARKER_RE.sub("", piece).replace(">>>", "").replace("<<<", ""))
-        if i == 0:
-            piece = piece.lstrip()
-            piece = "…" + piece[3:] if piece.startswith("...") else piece
-        if i == len(pieces) - 1:
-            piece = piece.rstrip()
-            piece = piece[:-3] + "…" if piece.endswith("...") else piece
-        if piece.startswith(" ") and out and out[-1].endswith(" "):
-            piece = piece[1:]
-        if hit and piece:
-            ranges.append([n, n + len(piece)])
-        out.append(piece)
-        n += len(piece)
-    plain = "".join(out)
+    n, opened = 0, None
+    for ch in plain_snippet(text):
+        if ch == _HL_ON:
+            opened = n
+        elif ch == _HL_OFF:
+            if opened is not None and n > opened:
+                ranges.append([opened, n])
+            opened = None
+        else:
+            plain_parts.append(ch)
+            n += 1
+    plain = "".join(plain_parts)
     if not ranges and (pattern := _term_pattern(terms or [])) is not None:
         ranges = [[m.start(), m.end()] for m in pattern.finditer(plain)]
-    return plain, ranges
+    if ranges:
+        start = _lead_start(plain, ranges[0][0])
+        if start:
+            plain, head = plain[start:], True
+            ranges = [[a - start, b - start] for a, b in ranges if a >= start]
+    if head and plain:
+        plain = "…" + plain
+        ranges = [[a + 1, b + 1] for a, b in ranges]
+    return plain + ("…" if tail and plain else ""), ranges
+
+
+def plain_snippet(text: str) -> str:
+    """One line of readable text from a stored message or a piece of one: JSON escapes decoded
+    (with an encoded argument object's closing quote and braces dropped), markdown fences, rules,
+    table pipes, emphasis and heading markers removed, whitespace collapsed. The highlight
+    sentinels pass through untouched."""
+    encoded = bool(_JSON_ESC_RE.search(text))
+    if encoded:
+        text = _JSON_ESC_RE.sub(lambda m: '"' if m.group().endswith('"') else " ", text)
+        text = re.sub(r"\\{2,}", lambda m: "\\", text)
+    text = _MD_FENCE_RE.sub(" ", text)
+    text = _MD_HEADING_RE.sub(" ", text)
+    text = _MD_RULE_RE.sub(" ", text)
+    text = _MD_EMPH_RE.sub("", text)
+    if len(_MD_CELL_RE.findall(text)) >= 2:          # a table: cells joined with a middle dot
+        text = _MD_PIPES_RE.sub(" · ", text)
+    text = _WS_RE.sub(" ", text)
+    if encoded:
+        text = _JSON_TAIL_RE.sub("", text)
+    return _EDGE_SEP_RE.sub("", text)
+
+
+def _lead_start(text: str, first: int) -> int:
+    """Where an excerpt of ``text`` starts so that at most SNIPPET_LEAD columns precede index
+    ``first``: after a space when there is one in that lead, never on a table separator."""
+    width, i = 0, first
+    while i > 0:
+        w = 2 if _WIDE_RE.match(text[i - 1]) else 1
+        if width + w > SNIPPET_LEAD:
+            break
+        width += w
+        i -= 1
+    if i == 0:
+        return 0
+    cell = text.find(" · ", i, first)                # start at a table cell when one begins here
+    space = cell + 2 if cell >= 0 else text.find(" ", i, first)
+    i = space + 1 if space >= 0 else i
+    while i < first and text[i] in " ·":
+        i += 1
+    return i
 
 
 def search_hit_is_noise(role: Any, snippet: Any) -> bool:
@@ -125,22 +189,57 @@ def search_hit_is_noise(role: Any, snippet: Any) -> bool:
     text = snippet.replace(">>>", "").replace("<<<", "") if isinstance(snippet, str) else ""
     if role == "user":
         return any(f in text for f in _DELIVERY_FRAGMENTS)
-    return bool(_JSON_KEY_RE.search(text))
+    # A key, or the escapes of encoded arguments when the excerpt holds no key ("})\n except").
+    return bool(_JSON_KEY_RE.search(text) or _JSON_ESC_RE.search(text))
+
+
+def tool_call_text(tool_calls: Any) -> str:
+    """The argument values of a message's tool calls as plain text, JSON decoded (arguments are
+    an encoded object, sometimes a string within it encoded again); one value per line."""
+    calls = tool_calls
+    if isinstance(calls, str):
+        try:
+            calls = json.loads(calls)
+        except ValueError:
+            return ""
+    out: list[str] = []
+
+    def walk(v: Any, depth: int = 0) -> None:
+        if depth > 6:
+            return
+        if isinstance(v, str):
+            s = v.strip()
+            if s[:1] in ("{", "["):
+                try:
+                    return walk(json.loads(s), depth + 1)
+                except ValueError:
+                    pass
+            if s:
+                out.append(s)
+        elif isinstance(v, dict):
+            for x in v.values():
+                walk(x, depth + 1)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x, depth + 1)
+
+    for c in calls if isinstance(calls, list) else [calls]:
+        if isinstance(c, dict):
+            fn = c.get("function") if isinstance(c.get("function"), dict) else c
+            walk(fn.get("arguments", fn.get("input")))
+    return "\n".join(out)
 
 
 def text_snippet(text: str, terms: list[str]) -> tuple[str, list[list[int]]] | None:
     """A one-line excerpt of ``text`` around the first occurrence of any term, with highlight
     ranges [start, end) for every occurrence inside it; None when no term occurs."""
     pattern = _term_pattern(terms)
-    flat = " ".join(text.split())
+    flat = plain_snippet(text.replace(_HL_ON, "").replace(_HL_OFF, ""))
     m = pattern.search(flat) if pattern is not None else None
     if m is None:
         return None
     first = m.start()
-    start = max(0, first - SNIPPET_BEFORE)
-    if start:
-        space = flat.find(" ", start, first)
-        start = space + 1 if space >= 0 else start
+    start = _lead_start(flat, first)
     end = min(len(flat), first + SNIPPET_AFTER)
     if end < len(flat):
         space = flat.rfind(" ", first, end)
@@ -405,7 +504,7 @@ class LinkAgent:
             item = {"stored_id": sid, "title": r.get("title") or row.get("title"), "snippet": "",
                     "highlights": [], "role": r.get("role"), "source": r.get("source"),
                     "last_active": r.get("last_active") or row.get("last_active") or r.get("session_started"),
-                    "message_count": r.get("message_count")}
+                    "message_count": r.get("message_count"), "hidden": bool(row.get("hidden"))}
             out.append(item)
             if search_hit_is_noise(r.get("role"), r.get("snippet")):
                 noisy.append(item)
@@ -426,7 +525,8 @@ class LinkAgent:
                 page = await self.hermes.rest("GET", f"/api/sessions/{item['stored_id']}/messages", params={
                     "limit": str(SEARCH_RESNIP_ROWS), "order": "latest"}, allow_404=True,
                     timeout=SEARCH_RESNIP_TIMEOUT_S)
-            for m in reversed((page or {}).get("messages") or []):
+            rows = [m for m in (page or {}).get("messages") or [] if isinstance(m, dict)]
+            for m in reversed(rows):
                 role = m.get("role")
                 if role not in ("user", "assistant"):
                     continue
@@ -439,6 +539,14 @@ class LinkAgent:
                     item["snippet"], item["highlights"] = hit
                     item["role"] = role
                     return
+            # No prose mentions it: the match is in a tool call's arguments; show them decoded.
+            for m in reversed(rows):
+                if m.get("role") == "assistant" and m.get("tool_calls"):
+                    hit = text_snippet(tool_call_text(m["tool_calls"]), terms)
+                    if hit is not None:
+                        item["snippet"], item["highlights"] = hit
+                        item["role"], item["tool"] = "assistant", True
+                        return
 
         tasks = [asyncio.create_task(one(i)) for i in items]
         done, pending = await asyncio.wait(tasks, timeout=SEARCH_RESNIP_TIMEOUT_S)

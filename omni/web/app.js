@@ -8,7 +8,7 @@ import { api } from './api.js';
 import { bus, state, setNodes, replaceSessions, setRequests } from './store.js';
 import { socket } from './ws.js';
 import { navigate, back, onRoute, parseHash, historyIndex, startRouter, setPopGuard } from './router.js';
-import { h, isDesktop, mq, fill, add } from './util.js';
+import { h, isDesktop, mq, fill, add, ls } from './util.js';
 import { applyTheme } from './theme.js';
 import { icon } from './ui/icons.js';
 import { spinner } from './ui/controls.js';
@@ -289,8 +289,23 @@ async function primeData() {
   }
 }
 
+// Whether this browser may hold a session cookie (the cookie itself is HttpOnly). Without one,
+// boot goes straight to the login page instead of asking /api/me for a 401 the console logs.
+const AUTH_HINT = 'omni.auth';
+function mayBeAuthed() {
+  try {
+    const v = localStorage.getItem(AUTH_HINT);
+    if (v === '1') return true;
+    if (v === '0') return false;
+    // No hint yet (a browser that logged in before the hint existed keeps other omni.* keys).
+    for (let i = 0; i < localStorage.length; i += 1) if (localStorage.key(i)?.startsWith('omni.')) return true;
+    return false;
+  } catch { return true; }
+}
+
 function afterLogin(user, fromForm = false) {
   authed = true;
+  ls.set(AUTH_HINT, '1');
   state.user = user || state.user;
   socket.start();
   primeData();
@@ -313,6 +328,7 @@ function teardown() {
 bus.on('unauthorized', () => {
   if (!authed) return;
   authed = false;
+  ls.set(AUTH_HINT, '0');
   socket.stop();
   teardown();
   const current = location.hash && !location.hash.startsWith('#/login') ? location.hash : '#/';
@@ -322,6 +338,7 @@ bus.on('unauthorized', () => {
 export async function logout() {
   try { await api.logout(); } catch { /* cookie may already be gone */ }
   authed = false;
+  ls.set(AUTH_HINT, '0');
   socket.stop();
   teardown();
   navigate('#/login', { replace: true });
@@ -342,12 +359,15 @@ mq.desktop.addEventListener?.('change', () => {
 
 // --------------------------------------------------------------------------- boot
 async function boot() {
-  try {
-    const me = await api.me();
-    afterLogin(me.user);
-  } catch (err) {
-    authed = false;
-    if (err.status !== 401) console.warn('[boot] /api/me failed', err);
+  if (mayBeAuthed()) {
+    try {
+      const me = await api.me();
+      afterLogin(me.user);
+    } catch (err) {
+      authed = false;
+      if (err.status === 401) ls.set(AUTH_HINT, '0');
+      else console.warn('[boot] /api/me failed', err);
+    }
   }
   document.getElementById('boot')?.remove();
   // Browser Back closes the topmost overlay first, like the Android back button (§2.2).
