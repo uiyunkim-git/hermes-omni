@@ -1,7 +1,8 @@
 """Persistent link state in /state (design §5 "Link persistence").
 
 link.json  {node_key?, canonical:{path:{stored_id,title}}, inflight:{delivery_id:{stored_id,user_row_id,submitted_at}},
-            last_seq:{stored_id:n}, runtime:{stored_id:{id,epoch}}}
+            last_seq:{stored_id:n}, runtime:{stored_id:{id,epoch}}, drafts:{stored_id:{cwd,title,created_at}},
+            title_hints:{stored_id:{title,at}}}
 status.json {connected, hub_url, node_id, at}   (polled by setup.sh)
 
 All writes are atomic (tmp + rename). ``mark_dirty()`` coalesces bursts into one write.
@@ -44,7 +45,8 @@ class LinkState:
         self.dir = state_dir
         self.path = os.path.join(state_dir, "link.json")
         self.status_path = os.path.join(state_dir, "status.json")
-        self.data: dict[str, Any] = {"canonical": {}, "inflight": {}, "last_seq": {}, "runtime": {}}
+        self.data: dict[str, Any] = {"canonical": {}, "inflight": {}, "last_seq": {}, "runtime": {}, "drafts": {},
+                                     "title_hints": {}}
         self._save_handle: asyncio.TimerHandle | None = None
 
     # --- io ------------------------------------------------------------------------------
@@ -59,7 +61,7 @@ class LinkState:
             pass
         except (OSError, ValueError) as e:
             log.warning("could not read %s (%s); starting with empty state", self.path, e)
-        for key in ("canonical", "inflight", "last_seq", "runtime"):
+        for key in ("canonical", "inflight", "last_seq", "runtime", "drafts", "title_hints"):
             if not isinstance(self.data.get(key), dict):
                 self.data[key] = {}
 
@@ -102,8 +104,21 @@ class LinkState:
         return self.data["last_seq"]
 
     @property
+    def drafts(self) -> dict[str, dict[str, Any]]:
+        return self.data["drafts"]
+
+    @property
     def runtime(self) -> dict[str, dict[str, Any]]:
         return self.data["runtime"]
+
+    @property
+    def title_hints(self) -> dict[str, dict[str, Any]]:
+        """Sessions whose auto-title must stay in the first prompt's language (omni/link/titles.py)."""
+        return self.data["title_hints"]
+
+    def drop_title_hint(self, stored_id: str) -> None:
+        if self.title_hints.pop(stored_id, None) is not None:
+            self.mark_dirty()
 
     def set_canonical(self, path: str, stored_id: str, title: str) -> None:
         self.canonical[path] = {"stored_id": stored_id, "title": title}
@@ -125,4 +140,8 @@ class LinkState:
             self.last_seq[new] = self.last_seq.pop(old)
         if old in self.runtime:
             self.runtime[new] = self.runtime.pop(old)
+        if old in self.drafts:
+            self.drafts[new] = self.drafts.pop(old)
+        if old in self.title_hints:
+            self.title_hints[new] = self.title_hints.pop(old)
         self.mark_dirty()

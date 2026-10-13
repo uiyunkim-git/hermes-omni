@@ -1,11 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-  <!-- Bars match the web UI's theme-color meta (light). -->
-  <color name="bar_bg">#F6F7F9</color>
-  <color name="surface">#F6F7F9</color>
-  <color name="text_primary">#15171C</color>
-  <color name="text_secondary">#5B6270</color>
-  <color name="accent">#4F6BED</color>
-  <color name="ic_launcher_bg">#1B1F3A</color>
-  <color name="ic_launcher_fg">#F2C14E</color>
+  <!-- Mirrors the web UI tokens (spec §4.1, light): bg, text, text-2, text-3, accent. -->
+  <color name="surface">#FAF9F6</color>
+  <color name="text_primary">#1F1E1B</color>
+  <color name="text_secondary">#5C5950</color>
+  <color name="text_tertiary">#78746A</color>
+  <color name="accent">#B4532A</color>
+  <color name="surface_elev">#FFFFFF</color>
+  <color name="on_accent">#FFFFFF</color>
+  <color name="pressed">#1A1F1E1B</color>
+  <!-- Launcher icon: not theme dependent. -->
+  <color name="ic_launcher_bg">#1F1E1B</color>
+  <color name="ic_launcher_fg">#D97A50</color>
 </resources>

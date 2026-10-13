@@ -40,12 +40,13 @@ class HubUnavailable(Exception):
 
 
 class HandlerError(Exception):
-    """Raised by request handlers to answer with a specific error code."""
+    """Raised by request handlers to answer with a specific error code (+ extra error fields)."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, **extra: Any):
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
+        self.extra = extra
 
 
 Handler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -141,7 +142,8 @@ class HubConnection:
         if frame.get("ok"):
             return frame.get("result") or {}
         err = frame.get("error") or {}
-        raise RemoteError(str(err.get("code", "error")), str(err.get("message", "")))
+        extra = {k: v for k, v in err.items() if k not in ("code", "message")}
+        raise RemoteError(str(err.get("code", "error")), str(err.get("message", "")), **extra)
 
     # --- connection loop -----------------------------------------------------------------
     async def _run(self) -> None:
@@ -319,7 +321,7 @@ class HubConnection:
             result = await self.handle_request(method, params)
             out = res_ok(rid, result)
         except HandlerError as e:
-            out = res_err(rid, e.code, e.message)
+            out = res_err(rid, e.code, e.message, **e.extra)
         except Exception as e:  # noqa: BLE001
             log.exception("hub request %s failed", method)
             out = res_err(rid, "internal", repr(e))

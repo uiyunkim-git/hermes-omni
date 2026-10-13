@@ -1,14 +1,15 @@
-// Browser WebSocket client for the hub's /ws (design §6): reconnect with jittered exponential
-// backoff, re-subscribe sessions after reconnect, fan incoming frames out on the bus as
-// "ws:<type>" events. Global frames (nodes, requests, hello) also update the store.
+// Browser WebSocket client for the hub's /ws (spec §5.6). Reconnects with backoff 0.5→8 s,
+// re-subscribes the open chat after reconnect and fans frames out on the bus as "ws:<type>".
+// Global frames (hello, nodes, sessions, requests) also update the store.
 
 import { api } from './api.js';
-import { bus, setConn, setNodes, setRequestsCount, state } from './store.js';
+import {
+  bus, setConn, setNodes, setRequests, replaceSessions, upsertSessions, removeSessions, state,
+} from './store.js';
 
 const PING_EVERY_MS = 25000;
 const DEAD_AFTER_MS = 70000;     // only enforced once the server has proven it answers pings
-const BACKOFF_MIN_MS = 1000;
-const BACKOFF_MAX_MS = 30000;
+const BACKOFF_MS = [500, 1000, 2000, 4000, 8000];
 
 class OmniSocket {
   constructor() {
@@ -19,8 +20,8 @@ class OmniSocket {
     this.pingTimer = 0;
     this.lastRx = 0;
     this.serverPongs = false;
-    /** key "node\u0000sid" → {node, stored_id, refs} */
-    this.subs = new Map();
+    /** The single live subscription (the open chat): {node, stored_id} | null */
+    this.sub = null;
     this.onVisible = () => {
       if (document.visibilityState === 'visible') this.kick();
     };
@@ -43,20 +44,20 @@ class OmniSocket {
     window.removeEventListener('online', this.onOnline);
     clearTimeout(this.retryTimer);
     clearInterval(this.pingTimer);
-    this.subs.clear();
+    this.sub = null;
     if (this.ws) {
       const ws = this.ws;
       this.ws = null;
       try { ws.close(1000, 'logout'); } catch { /* ignore */ }
     }
-    setConn('closed');
+    this.attempt = 0;
+    setConn('closed', 0);
   }
 
-  /** Reconnect immediately if we are waiting in backoff (tab became visible, network back). */
+  /** Reconnect now if we are waiting in backoff (tab visible again, network back, user tap). */
   kick() {
     if (!this.running || this.ws) return;
     clearTimeout(this.retryTimer);
-    this.attempt = 0;
     this.connect();
   }
 
@@ -73,14 +74,15 @@ class OmniSocket {
     }
     this.ws = ws;
     let opened = false;
-    setConn('connecting');
+    setConn('connecting', this.attempt);
 
     ws.onopen = () => {
       opened = true;
+      this.attempt = 0;
       this.lastRx = Date.now();
       this.serverPongs = false;
-      setConn('open');
-      for (const s of this.subs.values()) this.send({ op: 'sub', node: s.node, stored_id: s.stored_id });
+      setConn('open', 0);
+      if (this.sub) this.send({ op: 'sub', node: this.sub.node, stored_id: this.sub.stored_id });
       clearInterval(this.pingTimer);
       this.pingTimer = setInterval(() => this.heartbeat(), PING_EVERY_MS);
       bus.emit('ws:open');
@@ -98,7 +100,6 @@ class OmniSocket {
       if (this.ws !== ws) return;          // superseded or stopped
       this.ws = null;
       clearInterval(this.pingTimer);
-      setConn('closed');
       bus.emit('ws:close', { code: ev.code });
       this.scheduleRetry(opened, ev.code);
     };
@@ -109,14 +110,21 @@ class OmniSocket {
   dispatch(msg) {
     switch (msg.type) {
       case 'hello':
-        this.attempt = 0;
         if (msg.user) state.user = msg.user;
+        if (msg.hub_version) state.hubVersion = msg.hub_version;
         break;
       case 'nodes':
         setNodes(msg.nodes);
         break;
+      case 'sessions':
+        if (msg.full) replaceSessions(msg.sessions);
+        else {
+          if (Array.isArray(msg.remove) && msg.remove.length) removeSessions(msg.remove);
+          if (Array.isArray(msg.upsert) && msg.upsert.length) upsertSessions(msg.upsert);
+        }
+        break;
       case 'requests':
-        setRequestsCount(Number(msg.count) || 0);
+        setRequests(msg);
         break;
       case 'pong':
         this.serverPongs = true;
@@ -139,6 +147,8 @@ class OmniSocket {
 
   async scheduleRetry(wasOpen, code) {
     if (!this.running) return;
+    this.attempt += 1;
+    setConn('connecting', this.attempt);
     // A handshake that never opened (or an auth close) may mean the session cookie expired.
     if (!wasOpen || code === 4401 || code === 1008) {
       try {
@@ -151,9 +161,8 @@ class OmniSocket {
       }
       if (!this.running) return;
     }
-    const base = Math.min(BACKOFF_MAX_MS, BACKOFF_MIN_MS * 2 ** this.attempt);
-    const delay = Math.round(base * (0.7 + Math.random() * 0.6));
-    this.attempt = Math.min(this.attempt + 1, 10);
+    const base = BACKOFF_MS[Math.min(this.attempt - 1, BACKOFF_MS.length - 1)];
+    const delay = Math.round(base * (0.8 + Math.random() * 0.4));
     clearTimeout(this.retryTimer);
     this.retryTimer = setTimeout(() => this.connect(), delay);
   }
@@ -168,28 +177,26 @@ class OmniSocket {
     }
   }
 
+  /** Ask the hub to re-send the full sessions index and requests (pull-to-refresh). */
+  resync() {
+    return this.send({ op: 'resync' });
+  }
+
   /**
-   * Subscribe to a session's live stream. The hub answers each "sub" with a session.snapshot,
-   * and we re-send it after every reconnect. Returns an unsubscribe function.
+   * Subscribe to one session's live stream (exactly one at a time). The hub answers with a
+   * session.snapshot; it is re-sent after every reconnect. Returns an unsubscribe function.
    */
   subscribe(node, storedId) {
-    const key = `${node}\u0000${storedId}`;
-    let s = this.subs.get(key);
-    if (!s) {
-      s = { node, stored_id: storedId, refs: 0 };
-      this.subs.set(key, s);
+    if (this.sub && (this.sub.node !== node || this.sub.stored_id !== storedId)) {
+      this.send({ op: 'unsub', node: this.sub.node, stored_id: this.sub.stored_id });
     }
-    s.refs += 1;
+    const sub = { node, stored_id: storedId };
+    this.sub = sub;
     this.send({ op: 'sub', node, stored_id: storedId });
-    let done = false;
     return () => {
-      if (done) return;
-      done = true;
-      s.refs -= 1;
-      if (s.refs <= 0) {
-        this.subs.delete(key);
-        this.send({ op: 'unsub', node, stored_id: storedId });
-      }
+      if (this.sub !== sub) return;
+      this.sub = null;
+      this.send({ op: 'unsub', node, stored_id: storedId });
     };
   }
 }

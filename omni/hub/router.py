@@ -1,11 +1,16 @@
-"""Agent-to-agent message routing (design §5 link->hub methods, §6 dispatcher).
+"""Agent-to-agent message routing (design §5/§6, v3 spec §5.3).
 
-- `agent.send` validates, resolves the target address and stores a delivery (id minted by the
-  sender link, so retries are idempotent). wait=true blocks the caller until the target turn
-  finishes or timeout_s passes, unless the target is busy or waiting would deadlock, in which
-  case the send is downgraded to async ("target_busy_async").
+- `agent.send` validates, resolves ``to`` (an address ``node#sid`` / ``node/folder#sid``, a folder
+  ``node/folder``, or a session title, optionally ``node:title``) against the hub's session index
+  and stores a delivery (id minted by the sender link, so retries are idempotent). wait=true blocks
+  the caller until the target turn finishes or timeout_s passes, unless the target is busy or
+  waiting would deadlock, in which case the send is downgraded to async ("target_busy_async").
+- Loops are bounded twice: the causal chain (message → reply → message …) by MAX_HOPS, and the
+  messages between one pair of sessions within one conversation by PAIR_MESSAGE_CAP. A
+  conversation starts with a message sent from a turn that is not itself a delivery turn.
 - The dispatcher keeps at most one 'dispatched' delivery per target session and submits it
-  with link `session.prompt {mode:"queue"}`; deliveries are FIFO per target.
+  with link `session.prompt {mode:"queue"}`; deliveries are FIFO per target. Dispatching also
+  tells the target's open chats (`session.incoming`).
 - `turn.done` carrying a delivery id completes the delivery. When the original sender is a
   session expecting a reply and nobody waited for it synchronously, the reply is injected back
   into the sender as a 'reply' delivery.
@@ -21,11 +26,12 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from omni.proto import (MAX_HOPS, MESSAGE_MAX_CHARS, STORED_ID_RE, WAIT_DEFAULT_S, WAIT_MAX_S,
-                        RemoteError, format_address, format_reply_text, format_request_text,
-                        new_delivery_id, parse_address)
+from omni.proto import (MAX_HOPS, MESSAGE_MAX_CHARS, PAIR_MESSAGE_CAP, STORED_ID_RE, TO_MAX, WAIT_DEFAULT_S,
+                        WAIT_MAX_S, RemoteError, clean_title, format_address, format_reply_text,
+                        format_request_text, new_delivery_id, session_key, try_parse_address)
 
 from .links import LinkConnection, LinkManager, NodeUnavailable
+from .sessions import SessionIndex, row_title
 from .store import ACTIVE_STATUSES, Store
 
 if TYPE_CHECKING:
@@ -39,36 +45,44 @@ RETRY_BACKOFF_S = 30.0        # after a transient dispatch failure
 MAX_DISPATCH_ATTEMPTS = 5     # transient failures before a delivery is marked error
 STALE_DISPATCHED_S = 12 * 3600
 LINK_CALL_TIMEOUT = 60.0
-RESOLVE_CALL_TIMEOUT = 20.0   # projects.list rescan while resolving an unknown project
+RESOLVE_CALL_TIMEOUT = 20.0   # folders.list / session.create while resolving a folder target
+CANDIDATES_MAX = 5
+DIRECTORY_SESSIONS_MAX = 60
+_MENTION_TAIL_RE = re.compile(r"\(([^()\s]+)\)\s*$")
 
 SessionKey = tuple[str, str]   # (node_id, stored_id or "path:<abs>")
 
 
 class Rejected(Exception):
-    def __init__(self, reason: str, message: str = ""):
+    def __init__(self, reason: str, message: str = "", **extra: Any):
         super().__init__(message or reason)
         self.reason = reason
         self.message = message or reason
+        self.extra = extra
 
 
 @dataclass
 class Target:
     node: str
-    addr: str
-    project: str | None
-    path: str | None
-    stored: str | None           # explicit session id
-    canonical_hint: str | None   # canonical stored id from the node's last report
+    stored: str | None            # concrete session (None: folder target on an offline node)
+    path: str | None = None       # folder path (folder targets)
+    folder: str | None = None     # folder name
+    title: str | None = None
 
     @property
     def key(self) -> SessionKey:
-        return (self.node, self.stored or self.canonical_hint or f"path:{self.path}")
+        return (self.node, self.stored or f"path:{self.path}")
+
+    @property
+    def addr(self) -> str:
+        return session_key(self.node, self.stored) if self.stored else format_address(self.node, self.folder)
 
 
 class Router:
-    def __init__(self, store: Store, links: LinkManager):
+    def __init__(self, store: Store, links: LinkManager, index: SessionIndex):
         self.store = store
         self.links = links
+        self.index = index
         self.live: Live   # wired by the server
         self._waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
         # Active synchronous waits: delivery id -> (sender, target). Edges of the wait-for graph.
@@ -77,7 +91,6 @@ class Router:
         self._attempts: dict[str, int] = {}
         self._retry_at: dict[str, float] = {}
         self._last_inflight: dict[str, set[str]] = {}
-        self._canon: dict[tuple[str, str], str] = {}   # (node, project path) -> canonical stored id
         self._kick = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -103,7 +116,10 @@ class Router:
         if method == "agent.send":
             return await self.agent_send(node, params)
         if method == "agent.directory":
-            return {"nodes": self.directory()}
+            sid = params.get("stored_id")
+            query = params.get("query")
+            return self.directory(query if isinstance(query, str) else None,
+                                  (node, sid) if isinstance(sid, str) else None)
         if method == "agent.inbox":
             sid = params.get("stored_id")
             if not isinstance(sid, str) or not STORED_ID_RE.match(sid):
@@ -119,23 +135,27 @@ class Router:
             return {"delivery": d}
         raise RemoteError("unknown_method", f"hub does not implement {method}")
 
-    def directory(self) -> list[dict[str, Any]]:
-        out = []
+    def directory(self, query: str | None = None, you: SessionKey | None = None) -> dict[str, Any]:
+        nodes = [{"node_id": st.node_id, "display_name": st.info.get("display_name") or st.node_id,
+                  "online": self.links.is_online(st.node_id)}
+                 for st in sorted(self.links.nodes.values(), key=lambda s: s.node_id)]
+        if query and query.strip():
+            rows = self.index.search(query, limit=DIRECTORY_SESSIONS_MAX, include_hidden=False)
+        else:
+            rows = [r for r in self.index.hub_rows() if not r.get("hidden")][:DIRECTORY_SESSIONS_MAX]
+        sessions = [{"address": r["key"], "title": row_title(r), "node": r["node"],
+                     "folder": (r.get("folder") or {}).get("name"), "running": bool(r.get("running")),
+                     "online": r.get("node_online"), "last_active": r.get("last_active"),
+                     "you": you is not None and (r["node"], r["stored_id"]) == you} for r in rows]
+        folders = []
         for st in sorted(self.links.nodes.values(), key=lambda s: s.node_id):
-            projects = []
             for p in st.info.get("projects") or []:
-                if not isinstance(p, dict):
-                    continue
-                canon = p.get("canonical") or {}
-                projects.append({
-                    "address": p.get("address") or format_address(st.node_id, p.get("name")),
-                    "name": p.get("name"), "path": p.get("path"),
-                    "canonical_stored_id": canon.get("stored_id"),
-                    "running": bool(canon.get("running")),
-                })
-            out.append({"node_id": st.node_id, "display_name": st.info.get("display_name") or st.node_id,
-                        "online": self.links.is_online(st.node_id), "projects": projects})
-        return out
+                if isinstance(p, dict) and p.get("name") and not p.get("is_root"):
+                    if query and query.strip() and query.strip().lower() not in str(p["name"]).lower():
+                        continue
+                    folders.append({"address": format_address(st.node_id, p["name"]), "node": st.node_id,
+                                    "name": p["name"]})
+        return {"nodes": nodes, "sessions": sessions, "folders": folders}
 
     # --- agent.send ------------------------------------------------------------------
     async def agent_send(self, node: str, p: dict[str, Any]) -> dict[str, Any]:
@@ -152,18 +172,20 @@ class Router:
             row, wait, timeout_s, reason = await self._validate_send(node, p, did, t0)
         except Rejected as r:
             log.info("agent.send %s from %s rejected: %s", did, node, r.reason)
-            return {"delivery_id": did, "status": "rejected", "reason": r.reason}
+            return {"delivery_id": did, "status": "rejected", "reason": r.reason, **r.extra}
 
+        target_key = row.pop("_target_key")
         if not await self.store.run(self.store.insert_delivery, row):
             existing = await self.store.run(self.store.get_delivery, did)
             return _send_result(existing) if existing else {"delivery_id": did, "status": "error", "reason": "conflict"}
         d = await self.store.run(self.store.get_delivery, did)
+        assert d is not None
         log.info("delivery %s queued: %s -> %s (wait=%s%s)", did, row["from_addr"], row["to_addr"], wait,
                  f", {reason}" if reason else "")
         self._publish(d)
         if not wait:
             self.kick()
-            out: dict[str, Any] = {"delivery_id": did, "status": "queued"}
+            out: dict[str, Any] = {"delivery_id": did, "status": "queued", **_target_fields(d)}
             if reason:
                 out["reason"] = reason
             return out
@@ -171,7 +193,7 @@ class Router:
         sender: SessionKey = (node, row["from_stored"])
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._waiters[did] = fut
-        self._waits[did] = (sender, row["_target_key"])
+        self._waits[did] = (sender, target_key)
         self.kick()
         try:
             remaining = max(0.0, timeout_s - (time.monotonic() - t0))
@@ -179,7 +201,7 @@ class Router:
             return _send_result(done)
         except TimeoutError:
             log.info("delivery %s: wait timed out after %ss; reply will be injected later", did, timeout_s)
-            return {"delivery_id": did, "status": "timeout",
+            return {"delivery_id": did, "status": "timeout", **_target_fields(d),
                     "reason": f"no reply within {timeout_s}s; the reply will arrive later as a new turn"}
         finally:
             # After this point a late turn.done finds no waiter and injects a reply turn.
@@ -191,13 +213,6 @@ class Router:
         from_stored = p.get("from_stored_id")
         if not isinstance(from_stored, str) or not STORED_ID_RE.match(from_stored):
             raise Rejected("bad_request", "from_stored_id required")
-        from_addr = p.get("from_address")
-        try:
-            fa = parse_address(from_addr if isinstance(from_addr, str) else "")
-        except ValueError:
-            raise Rejected("bad_from_address") from None
-        if fa["node"] != node:
-            raise Rejected("from_node_mismatch")
         chain = p.get("chain") or []
         if not isinstance(chain, list) or not all(isinstance(c, str) for c in chain):
             raise Rejected("bad_request", "chain must be a list of addresses")
@@ -211,6 +226,7 @@ class Router:
         expect_reply = bool(p.get("expect_reply", True))
         wait = bool(p.get("wait", False))
         timeout_s = _int(p.get("timeout_s"), WAIT_DEFAULT_S, 1, WAIT_MAX_S)
+        sender: SessionKey = (node, from_stored)
 
         def budget(cap: float) -> float:
             """Link-call timeout during validation: never beyond the caller's wait budget."""
@@ -218,44 +234,55 @@ class Router:
                 return cap
             return min(cap, max(1.0, timeout_s - (time.monotonic() - t0)))
 
-        target = await self.resolve(p.get("to"), budget(RESOLVE_CALL_TIMEOUT))
-        sender: SessionKey = (node, from_stored)
+        target = await self.resolve(p.get("to"), sender, budget(RESOLVE_CALL_TIMEOUT))
+        conv_id = await self._conversation(p.get("cause_id"), did)
+        if target.stored:
+            n = await self.store.run(self.store.count_pair_messages, conv_id, sender, (target.node, target.stored))
+            if n >= PAIR_MESSAGE_CAP:
+                raise Rejected("collab_limit", f"{n} messages between these sessions in this conversation")
         reason = None
-        if wait and not target.stored and not target.canonical_hint and self.links.is_online(target.node):
-            # Deadlock/busy checks need the concrete session; resolve it now (dispatch would anyway).
-            with contextlib.suppress(RemoteError, NodeUnavailable, ConnectionError, TimeoutError):
-                res = await self.links.call(target.node, "session.ensure", {"path": target.path},
-                                            budget(LINK_CALL_TIMEOUT))
-                if isinstance(res.get("stored_id"), str) and res["stored_id"]:
-                    target.canonical_hint = res["stored_id"]
-                    self._canon[(target.node, target.path or "")] = res["stored_id"]
         if wait:
             busy = await self._target_busy(target)
             if busy or self._would_deadlock(sender, target, chain):
                 wait, reason = False, "target_busy_async"
             elif not self.links.is_online(target.node):
-                wait, reason = False, "target_offline"
+                wait = False
+        if not self.links.is_online(target.node):
+            reason = "offline_queued"
+        sender_row = self.index.get(node, from_stored)
+        from_title = p.get("from_title") if isinstance(p.get("from_title"), str) and p.get("from_title") \
+            else (row_title(sender_row) if sender_row else None)
         row = {
             "id": did, "kind": "message", "from_node": node, "from_stored": from_stored,
-            "from_addr": format_address(fa["node"], fa["project"], fa["stored_id"]),
+            "from_addr": session_key(node, from_stored), "from_title": clean_title(from_title) or None,
             "to_node": target.node, "to_addr": target.addr, "to_path": target.path, "to_stored": target.stored,
+            "to_title": target.title, "conv_id": conv_id,
             "message": message, "expect_reply": expect_reply, "wait": wait, "chain": chain,
             "_target_key": target.key,
         }
         return row, wait, timeout_s, reason
 
+    async def _conversation(self, cause_id: Any, did: str) -> str:
+        """The conversation a new message belongs to: that of the delivery its sender is answering
+        (a message or reply turn), or a new one when the sender's turn came from its user."""
+        if isinstance(cause_id, str) and DELIVERY_ID_RE.match(cause_id):
+            cause = await self.store.run(self.store.get_delivery, cause_id)
+            if cause is not None:
+                return cause.get("conv_id") or cause["id"]
+        return did
+
     async def human_send(self, to: Any, message: Any, expect_reply: bool) -> dict[str, Any]:
-        """POST /api/send: a human -> session message. Raises Rejected."""
+        """POST /api/send: a human -> session message (debugging aid). Raises Rejected."""
         if not isinstance(message, str) or not message.strip():
             raise Rejected("empty_message")
         if len(message) > MESSAGE_MAX_CHARS:
             raise Rejected("message_too_long")
-        target = await self.resolve(to)
+        target = await self.resolve(to, None)
         did = new_delivery_id()
         await self.store.run(self.store.insert_delivery, {
             "id": did, "kind": "message", "from_node": None, "from_stored": None, "from_addr": "human",
             "to_node": target.node, "to_addr": target.addr, "to_path": target.path, "to_stored": target.stored,
-            "message": message, "expect_reply": expect_reply, "chain": [],
+            "to_title": target.title, "conv_id": did, "message": message, "expect_reply": expect_reply, "chain": [],
         })
         d = await self.store.run(self.store.get_delivery, did)
         assert d is not None
@@ -272,47 +299,109 @@ class Router:
             await self._finish(d)
         return d
 
-    async def resolve(self, to: Any, call_timeout: float = RESOLVE_CALL_TIMEOUT) -> Target:
-        """Parse and resolve an address; an unknown project triggers one projects.list rescan
-        (bounded by call_timeout). Raises Rejected."""
-        try:
-            a = parse_address(to if isinstance(to, str) else "")
-        except ValueError as e:
-            raise Rejected("bad_address", str(e)) from None
-        node = a["node"]
-        st = self.links.nodes.get(node)
-        if st is None:
-            raise Rejected("unknown_target", f"no node named {node}")
-        project, sid = a["project"], a["stored_id"]
-        if project is None:
-            return Target(node, format_address(node, None, sid), None, None, sid, None)
-        proj = st.find_project(name=project)
+    # --- target resolution -----------------------------------------------------------
+    async def resolve(self, to: Any, sender: SessionKey | None,
+                      call_timeout: float = RESOLVE_CALL_TIMEOUT) -> Target:
+        """Resolve ``to`` (v3 spec §5.3 order). Raises Rejected."""
+        if not isinstance(to, str) or not to.strip() or len(to.strip()) > TO_MAX + 40:
+            raise Rejected("bad_target", "to must be a non-empty string")
+        s = to.strip()
+        if s.startswith("@"):
+            s = s[1:].strip()
+        if s.lower().startswith("omni:"):
+            s = s[5:].strip()
+        m = _MENTION_TAIL_RE.search(s)
+        if m and try_parse_address(m.group(1)):
+            s = m.group(1)   # "@Title (node#sid)" mention: the address wins
+        a = try_parse_address(s)
+        if a is not None and a["node"] in self.links.nodes:
+            target = await self._resolve_address(a, call_timeout)
+        else:
+            target = self._resolve_title(s)
+        if sender is not None and target.stored and (target.node, target.stored) == sender:
+            raise Rejected("self", "a session cannot message itself")
+        return target
+
+    async def _resolve_address(self, a: dict[str, str | None], call_timeout: float) -> Target:
+        node = str(a["node"])
+        sid, folder = a["stored_id"], a["project"]
+        if sid:
+            row = self.index.get(node, sid)
+            return Target(node, sid, title=row_title(row) if row else None,
+                          folder=(row.get("folder") or {}).get("name") if row else folder)
+        st = self.links.nodes[node]
+        proj = st.find_project(name=folder)
         if proj is None and self.links.is_online(node):
             with contextlib.suppress(RemoteError, NodeUnavailable, ConnectionError, TimeoutError):
-                res = await self.links.call(node, "projects.list", {}, timeout=call_timeout)
-                if isinstance(res.get("projects"), list):
-                    await self.links.update_info(node, projects=res["projects"])
-                    proj = st.find_project(name=project)
+                res = await self.links.call(node, "folders.list", {}, timeout=call_timeout)
+                if isinstance(res.get("folders"), list):
+                    await self.links.update_info(node, projects=res["folders"])
+                    proj = st.find_project(name=folder)
         if proj is None or not proj.get("path"):
-            raise Rejected("unknown_project", f"{node} has no project {project}")
-        return Target(node, format_address(node, project, sid), project, proj["path"], sid,
-                      self._canonical_for(node, proj["path"]))
+            raise Rejected("unknown_target", f"{node} has no folder {folder}",
+                           suggestions=self._suggestions(str(folder or "")))
+        path = str(proj["path"])
+        target = Target(node, None, path=path, folder=str(folder))
+        await self._bind_folder(target, call_timeout)
+        return target
 
-    def _canonical_for(self, node: str, path: str | None) -> str | None:
-        """Canonical stored id for a project path: node's last report, else last session.ensure."""
-        st = self.links.nodes.get(node)
-        proj = st.find_project(path=path) if st and path else None
-        canon = ((proj or {}).get("canonical") or {}).get("stored_id")
-        return canon or self._canon.get((node, path or ""))
+    async def _bind_folder(self, t: Target, call_timeout: float = LINK_CALL_TIMEOUT) -> None:
+        """A folder target becomes its most recent session, or a new one titled after the folder.
+        Without a link (offline node) the target stays a folder and is bound at dispatch."""
+        rows = [r for r in self.index.rows.get(t.node, {}).values()
+                if not r.get("hidden") and (r.get("folder") or {}).get("path") == t.path]
+        if rows:
+            best = max(rows, key=lambda r: r.get("last_active") or 0)
+            t.stored, t.title = best["stored_id"], row_title(best)
+            return
+        if not self.links.is_online(t.node):
+            t.title = t.folder
+            return
+        try:
+            res = await self.links.call(t.node, "session.create", {"path": t.path, "title": t.folder},
+                                        timeout=call_timeout)
+        except (RemoteError, NodeUnavailable, ConnectionError, TimeoutError) as e:
+            raise Rejected("unknown_target", f"could not start a session in {t.folder}: {e}") from None
+        t.stored, t.title = res.get("stored_id"), res.get("title") or t.folder
+        row = res.get("row")
+        if isinstance(row, dict) and isinstance(row.get("stored_id"), str):
+            await self.index.on_update(t.node, False, [row], [])
+        log.info("started session %s#%s in folder %s for a message", t.node, t.stored, t.folder)
+
+    def _resolve_title(self, s: str) -> Target:
+        scope: str | None = None
+        title = s
+        head, sep, rest = s.partition(":")
+        if sep and head.strip().lower() in self.links.nodes and rest.strip():
+            scope, title = head.strip().lower(), rest.strip()
+        q = title.strip().lower()
+        rows = [(n, r) for n, r in self.index.all_rows()
+                if not r.get("hidden") and (scope is None or n == scope)]
+        exact = [(n, r) for n, r in rows if (r.get("title") or "").strip().lower() == q]
+        matches = exact or [(n, r) for n, r in rows if (r.get("title") or "").strip().lower().startswith(q)]
+        if len(matches) == 1:
+            n, r = matches[0]
+            return Target(n, r["stored_id"], title=row_title(r), folder=(r.get("folder") or {}).get("name"))
+        if matches:
+            matches.sort(key=lambda x: x[1].get("last_active") or 0, reverse=True)
+            cands = [{"address": session_key(n, r["stored_id"]), "title": row_title(r), "node": n,
+                      "folder": (r.get("folder") or {}).get("name")} for n, r in matches[:CANDIDATES_MAX]]
+            raise Rejected("ambiguous_target", f"{len(matches)} sessions match {title!r}", candidates=cands)
+        raise Rejected("unknown_target", f"no session matches {title!r}",
+                       suggestions=self._suggestions(title, scope))
+
+    def _suggestions(self, q: str, node: str | None = None) -> list[dict[str, Any]]:
+        return [{"address": r["key"], "title": row_title(r), "node": r["node"],
+                 "folder": (r.get("folder") or {}).get("name")}
+                for r in self.index.search(q, node=node, limit=CANDIDATES_MAX, include_hidden=False)]
 
     async def _target_busy(self, t: Target) -> bool:
         node, sid = t.key
         if self.live.is_running(node, sid):
             return True
-        if not t.stored and t.path:
-            proj = self.links.nodes[node].find_project(path=t.path)
-            if proj and (proj.get("canonical") or {}).get("running"):
-                return True
+        row = self.index.get(node, sid)
+        if row and row.get("running"):
+            return True
         if t.key in self._dispatching:
             return True
         for status in ACTIVE_STATUSES:
@@ -338,23 +427,21 @@ class Router:
                 stack.extend(edges.get(k, ()))
         # Target already upstream in this causal chain: it is (or may be) blocked on us.
         for addr in chain:
-            if addr == t.addr:
+            a = try_parse_address(addr)
+            if a is None or a["node"] != t.node:
+                continue
+            if a["stored_id"] and a["stored_id"] == t.stored:
                 return True
-            with contextlib.suppress(ValueError):
-                a = parse_address(addr)
-                if a["node"] != t.node:
-                    continue
-                if a["stored_id"] and a["stored_id"] == (t.stored or t.canonical_hint):
-                    return True
-                if a["project"] and a["project"] == t.project and not a["stored_id"] and not t.stored:
-                    return True
+            if a["project"] and not a["stored_id"] and a["project"] == t.folder:
+                return True
         return False
 
-    def _row_key(self, d: dict[str, Any]) -> SessionKey:
+    @staticmethod
+    def _row_key(d: dict[str, Any]) -> SessionKey:
         node = d["to_node"]
         if d.get("to_stored"):
             return (node, d["to_stored"])
-        return (node, self._canonical_for(node, d.get("to_path")) or f"path:{d.get('to_path')}")
+        return (node, f"path:{d.get('to_path')}")
 
     # --- link events -----------------------------------------------------------------
     async def on_hello(self, node: str, inflight: list[str]) -> None:
@@ -399,9 +486,6 @@ class Router:
         old_k, new_k = (node, old), (node, new)
         for did, (src, dst) in list(self._waits.items()):
             self._waits[did] = (new_k if src == old_k else src, new_k if dst == old_k else dst)
-        for ck, sid in list(self._canon.items()):
-            if ck[0] == node and sid == old:
-                self._canon[ck] = new
         if n:
             log.info("node %s session %s -> %s: retargeted %d deliveries", node, old, new, n)
 
@@ -435,16 +519,14 @@ class Router:
                 body = (body or "") + "\n\n(the target's turn was interrupted; this reply may be incomplete)"
         else:
             body = f"(delivery failed: {d.get('error') or 'error'} — no reply will come)"
-        try:
-            fa = parse_address(d["from_addr"])
-            to_addr = format_address(fa["node"], fa["project"], d["from_stored"])
-        except ValueError:
-            to_addr = format_address(d["from_node"], None, d["from_stored"])
+        to_addr = session_key(d["from_node"], d["from_stored"])
+        from_addr = session_key(d["to_node"], d["to_stored"]) if d.get("to_stored") else d["to_addr"]
         rid = new_delivery_id()
         await self.store.run(self.store.insert_delivery, {
             "id": rid, "kind": "reply", "parent_id": d["id"],
-            "from_node": d["to_node"], "from_stored": d.get("to_stored"), "from_addr": d["to_addr"],
-            "to_node": d["from_node"], "to_addr": to_addr, "to_path": None, "to_stored": d["from_stored"],
+            "from_node": d["to_node"], "from_stored": d.get("to_stored"), "from_addr": from_addr,
+            "from_title": d.get("to_title"), "to_node": d["from_node"], "to_addr": to_addr, "to_path": None,
+            "to_stored": d["from_stored"], "to_title": d.get("from_title"), "conv_id": d.get("conv_id") or d["id"],
             "message": body or "", "expect_reply": False, "chain": d.get("chain") or [],
         })
         r = await self.store.run(self.store.get_delivery, rid)
@@ -453,7 +535,8 @@ class Router:
             self._publish(r)
 
     def _publish(self, d: dict[str, Any]) -> None:
-        self.live.publish_all({"type": "delivery", "delivery": d})
+        self.live.publish_delivery(d)
+        self.index.deliveries_changed()
 
     # --- dispatcher ------------------------------------------------------------------
     async def _dispatch_loop(self) -> None:
@@ -502,12 +585,17 @@ class Router:
                 return
             stored = d.get("to_stored")
             if not stored:
-                res = await conn.call("session.ensure", {"path": d["to_path"]}, LINK_CALL_TIMEOUT)
-                stored = res.get("stored_id")
-                if not isinstance(stored, str) or not stored:
-                    raise RemoteError("bad_response", "session.ensure returned no stored_id")
-                self._canon[(node, d["to_path"] or "")] = stored
-                await self.store.run(self.store.update_delivery, did, ("queued",), to_stored=stored)
+                # A folder target queued while its node was offline: bind it now.
+                t = Target(node, None, path=d.get("to_path"), folder=_folder_of(d.get("to_addr")))
+                try:
+                    await self._bind_folder(t)
+                except Rejected as r:
+                    raise RemoteError("unknown_target", r.message) from None
+                if not t.stored:
+                    raise RemoteError("bad_response", "no session for the folder target")
+                stored = t.stored
+                await self.store.run(self.store.update_delivery, did, ("queued",), to_stored=stored,
+                                     to_title=t.title)
             att = await conn.call("session.attach", {"stored_id": stored}, LINK_CALL_TIMEOUT)
             tip = att.get("stored_id")
             if isinstance(tip, str) and STORED_ID_RE.match(tip) and tip != stored:
@@ -520,9 +608,11 @@ class Router:
                     self._dispatching.add(tip_key)
                     extra_keys.append(tip_key)
             if d["kind"] == "reply":
-                text = format_reply_text(did, d.get("parent_id") or "?", d.get("from_addr") or "?", d["message"])
+                text = format_reply_text(did, d.get("parent_id") or "?", d.get("from_addr") or "?", d["message"],
+                                         from_title=d.get("from_title"))
             else:
-                text = format_request_text(did, d.get("from_addr") or "human", d["message"], d["expect_reply"])
+                text = format_request_text(did, d.get("from_addr") or "human", d["message"], d["expect_reply"],
+                                           from_title=d.get("from_title"))
             if self.links.get(node) is not conn or conn.closed:
                 return  # link replaced meanwhile; next pass uses the new one
             upd = await self.store.run(self.store.update_delivery, did, ("queued",), status="dispatched",
@@ -531,6 +621,7 @@ class Router:
                 return  # cancelled meanwhile
             submitted = True
             self._publish(upd)
+            self.live.publish_incoming(node, stored, upd)
             res = await conn.call("session.prompt", {"stored_id": stored, "text": text, "mode": "queue",
                                                      "delivery_id": did}, LINK_CALL_TIMEOUT)
             self._attempts.pop(did, None)
@@ -544,6 +635,8 @@ class Router:
         except RemoteError as e:
             if submitted:
                 await self._fail(did, f"{e.code}: {e.message}")
+            elif e.code in ("not_found", "unknown_target"):
+                await self._fail(did, f"{e.code}: {e.message}", ("queued",))
             else:
                 await self._transient(did, f"{e.code}: {e.message}")
         except (ConnectionError, NodeUnavailable, TimeoutError) as e:
@@ -581,10 +674,18 @@ class Router:
                 await self._fail(d["id"], "stale: no turn.done received", ("dispatched",))
 
 
+def _folder_of(addr: Any) -> str | None:
+    a = try_parse_address(addr)
+    return a["project"] if a else None
+
+
+def _target_fields(d: dict[str, Any]) -> dict[str, Any]:
+    addr = session_key(d["to_node"], d["to_stored"]) if d.get("to_stored") else d.get("to_addr")
+    return {"to_address": addr, "to_title": d.get("to_title")}
 
 
 def _send_result(d: dict[str, Any]) -> dict[str, Any]:
-    out: dict[str, Any] = {"delivery_id": d["id"]}
+    out: dict[str, Any] = {"delivery_id": d["id"], **_target_fields(d)}
     if d["status"] == "done":
         out.update(status="done", reply=d.get("reply") or "")
         if d.get("error"):

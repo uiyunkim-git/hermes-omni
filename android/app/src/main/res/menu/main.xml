@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<menu xmlns:android="http://schemas.android.com/apk/res/android">
-  <item android:id="@+id/action_reload" android:title="@string/menu_reload" android:showAsAction="never" />
-  <item android:id="@+id/action_change_hub" android:title="@string/menu_change_hub" android:showAsAction="never" />
-  <item android:id="@+id/action_clear_cookies" android:title="@string/menu_clear_cookies" android:showAsAction="never" />
-</menu>

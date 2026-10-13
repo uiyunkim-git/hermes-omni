@@ -22,6 +22,7 @@ from .context import HUB_KEY, Hub
 from .links import LinkManager
 from .live import Live
 from .router import Router
+from .sessions import SessionIndex
 from .store import Store
 from .web import security_headers, setup_web
 
@@ -32,10 +33,12 @@ def build_app(cfg: Config) -> web.Application:
     store = Store(cfg.db_path)
     auth = Auth(cfg)
     links = LinkManager(store, cfg.join_token)
-    router = Router(store, links)
-    live = Live(links)
-    links.router, links.live, router.live = router, live, live
-    hub = Hub(cfg=cfg, store=store, auth=auth, links=links, router=router, live=live)
+    index = SessionIndex(store, links)
+    router = Router(store, links, index)
+    live = Live(links, index)
+    links.router, links.live, links.index = router, live, index
+    router.live = index.live = live
+    hub = Hub(cfg=cfg, store=store, auth=auth, links=links, router=router, live=live, index=index)
 
     app = web.Application(middlewares=[security_headers, error_middleware, auth.middleware],
                           client_max_size=4 * 1024 * 1024)
@@ -53,6 +56,7 @@ async def _lifecycle(app: web.Application) -> AsyncIterator[None]:
     hub = app[HUB_KEY]
     await hub.store.open()
     await hub.links.start()
+    await hub.index.start()
     hub.router.start()
     hub.live.start()
     log.info("hermes-omni hub %s listening on %s:%d (public url: %s, %d known nodes)", __version__,
@@ -60,6 +64,7 @@ async def _lifecycle(app: web.Application) -> AsyncIterator[None]:
     yield
     await hub.live.stop()
     await hub.router.stop()
+    await hub.index.stop()
     await hub.store.close()
 
 

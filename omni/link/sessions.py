@@ -7,7 +7,10 @@ Responsibilities (design §1, §5):
   ``session.request_cancel`` frames for the hub.
 * every ``message.complete`` produces one ``turn.done``; its ``delivery_id`` comes from the omni
   marker in the user row (REST) whose id is ``persisted_turn.user_row_id``.
-* canonical sessions per folder: ``session.create`` + ``session.title`` (4022 → reuse that id).
+* per-session live state for the session index (running, open requests, activity, last turn
+  status, queued prompts) and ``session.meta`` (model, reasoning, context, usage).
+* sessions are created only on request (``session.create``); legacy v2 hubs may still call
+  ``session.ensure`` (canonical session per folder).
 * reconnect: re-resume, gap-fill with ``session.events.since``, re-forward open requests, and
   settle deliveries whose turn was lost (Hermes restart) with an error ``turn.done``.
 """
@@ -25,21 +28,29 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from omni.proto import FORWARD_REQUEST_METHODS, canonical_title, ev, find_marker
+from omni.proto import FORWARD_REQUEST_METHODS, canonical_title, ev, find_marker, parse_omni_header
 from omni.link.config import Config
 from omni.link.hermes import STALE_SESSION_CODES, HermesClient, HermesError, HermesUnavailable
 from omni.link.state import LinkState
+from omni.link.titles import has_hangul
 from omni.link.util import TaskSet, to_text, trim
 
 log = logging.getLogger("omni.link.sessions")
 
 TITLE_IN_USE = 4022
+STEER_UNSUPPORTED = 4010
 _IN_USE_RE = re.compile(r"in use by session ([A-Za-z0-9_.:-]+)")
+LOCKED_TEXT = "This chat is open in another Hermes window"
+_SURFACE_RE = re.compile(r"opened by (\S+?)[.,]?(?:\s|$)")
 REATTACH_WINDOW_S = 2 * 3600       # on link start, re-attach sessions active within this window
 MSG_CONTENT_MAX = 8000
 TOOL_CONTENT_MAX = 2000
-MESSAGES_MAX = 1000       # session.messages cap (matches the hub API)
+MESSAGES_MAX = 500        # session.messages page cap
 HERMES_PAGE_MAX = 500     # Hermes REST serves at most this many rows per request
+META_THROTTLE_S = 1.0
+QUEUE_IDLE_CLEAR_S = 3.0  # a queued prompt not started this long after the session went idle was dropped
+                          # by Hermes (session.interrupt clears its queue): it is submitted again
+QUEUE_TEXT_MAX = 2000
 REQUEST_PARAM_MAX = 4000
 RECENT_DONE_MAX = 256
 # Sessions attached to a live socket are never reaped by Hermes, so idle ones are dropped from the
@@ -52,12 +63,22 @@ UNCONFIRMED_VERIFY_S = 900
 
 
 class SessionOpError(Exception):
-    """A hub-facing error with a string code (sent back in res_err)."""
+    """A hub-facing error with a string code (sent back in res_err); ``extra`` adds error fields."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, **extra: Any):
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
+        self.extra = extra
+
+
+def locked_error(e: HermesError) -> SessionOpError | None:
+    """Hermes' single-writer refusal ("This chat is open in another Hermes window…") as session_locked."""
+    if LOCKED_TEXT not in (e.message or ""):
+        return None
+    first = e.message.strip().splitlines()[0]
+    m = _SURFACE_RE.search(e.message)
+    return SessionOpError("session_locked", first, surface=m.group(1) if m else "다른 창")
 
 
 @dataclass
@@ -76,6 +97,55 @@ class Attached:
     # (older seqs) is applied first; otherwise the seq dedupe would discard the replay.
     replaying: bool = False
     parked: list[dict[str, Any]] = field(default_factory=list)
+    # Live state for the session index / browser.
+    last_turn_status: str | None = None          # complete|interrupted|error of the last turn.done
+    activity: dict[str, str] | None = None       # {kind: thinking|tool|writing, text} while running
+    completes: int = 0                           # message.complete count (queue bookkeeping)
+    queue: list[dict[str, Any]] = field(default_factory=list)   # prompts Hermes queued, FIFO
+    meta: dict[str, Any] = field(default_factory=dict)
+    meta_sent: str | None = None
+    meta_sent_at: float = 0.0
+    meta_timer: asyncio.TimerHandle | None = None
+    queue_timer: asyncio.TimerHandle | None = None
+
+
+# --- activity (one line for the session list while a turn runs) --------------------------
+_VERBS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "read_file": ("Read", ("path", "file_path")), "write_file": ("Write", ("path", "file_path")),
+    "patch": ("Edit", ("path", "file_path")), "search_files": ("Search", ("pattern", "query")),
+    "terminal": ("Bash", ("command",)), "execute_code": ("Run", ("code", "language")),
+    "web_search": ("Web search", ("query",)), "x_search": ("Web search", ("query",)),
+    "web_extract": ("Fetch", ("url", "urls")), "vision_analyze": ("View", ("image_url", "path")),
+    "image_generate": ("Image", ("prompt",)), "memory": ("Memory", ("action",)),
+    "skill_view": ("Skill", ("name",)), "skill_manage": ("Skill", ("name",)), "skills_list": ("Skill", ()),
+    "delegate_task": ("Delegate", ("goal", "task")), "session_search": ("Session search", ("query",)),
+    "hub_send": ("Message", ("to",)), "hub_directory": ("Directory", ("query",)), "hub_inbox": ("Inbox", ()),
+    "cronjob_manage": ("Cron", ("action",)),
+}
+
+
+def tool_activity(name: Any, args: Any) -> str:
+    """"Bash · npm test" style label for a running tool (English verbs, as in the transcript)."""
+    name = str(name or "tool")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+    verb, keys = _VERBS.get(name, ("Browser" if name.startswith("browser_") else name, ("url", "action")))
+    target = ""
+    for k in keys:
+        v = args.get(k)
+        if isinstance(v, list) and v:
+            v = v[0]
+        if isinstance(v, str) and v.strip():
+            target = v.strip().splitlines()[0]
+            break
+    if len(target) > 60:
+        target = target[:59] + "…"
+    return f"{verb} · {target}" if target else verb
 
 
 # --- event filtering ---------------------------------------------------------------------
@@ -91,6 +161,46 @@ def _usage(u: Any) -> dict[str, Any] | None:
     if not isinstance(u, dict):
         return None
     return {"input": u.get("input"), "output": u.get("output"), "total": u.get("total")}
+
+
+def _n(v: Any) -> float | int | None:
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def meta_from_usage(u: Any) -> dict[str, Any]:
+    """session.meta fields carried by a Hermes usage dict (session.info / session.usage / message.complete)."""
+    if not isinstance(u, dict):
+        return {}
+    out: dict[str, Any] = {}
+    used, mx = _n(u.get("context_used")), _n(u.get("context_max"))
+    if used is not None and mx:
+        pct = _n(u.get("context_percent"))
+        out["context"] = {"used": used, "max": mx,
+                          "percent": round(used / mx * 100, 1) if pct is None or isinstance(pct, int) else pct}
+    usage = {k: _n(u.get(k)) for k in ("input", "output", "total", "calls", "cache_hit_pct")}
+    if any(v is not None for v in usage.values()):
+        out["usage"] = usage
+    if isinstance(u.get("model"), str) and u["model"]:
+        out["model"] = u["model"]
+    return out
+
+
+def meta_from_info(p: dict[str, Any]) -> dict[str, Any]:
+    """session.meta fields from a session.info payload (never forwards the huge rest)."""
+    out: dict[str, Any] = {}
+    for k in ("model", "provider", "reasoning_effort"):
+        if isinstance(p.get(k), str):
+            out[k] = p[k] or None
+    for k in ("fast", "yolo"):
+        if isinstance(p.get(k), bool):
+            out[k] = p[k]
+    if isinstance(p.get("approval_mode"), str):
+        out["approval_mode"] = p["approval_mode"]
+    out.update(meta_from_usage(p.get("usage")))
+    return out
+
+
+META_KEYS = ("model", "provider", "reasoning_effort", "fast", "yolo", "approval_mode", "context", "usage")
 
 
 def filter_event(etype: str, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -157,9 +267,21 @@ def map_message(row: dict[str, Any]) -> dict[str, Any]:
         text = tool_calls if isinstance(tool_calls, str) else json.dumps(tool_calls, ensure_ascii=False, default=str)
         if len(text) > TOOL_CONTENT_MAX:
             tool_calls = trim(text, TOOL_CONTENT_MAX)
-    return {"id": row.get("id"), "role": role, "content": trim(to_text(row.get("content")), limit),
-            "timestamp": row.get("timestamp"), "tool_name": row.get("tool_name") or None,
-            "tool_calls": tool_calls or None}
+    content = to_text(row.get("content"))
+    out = {"id": row.get("id"), "role": role, "content": trim(content, limit),
+           "timestamp": row.get("timestamp"), "tool_name": row.get("tool_name") or None,
+           "tool_calls": tool_calls or None,
+           "omni": parse_omni_header(content) if role == "user" and content.startswith("⟦omni:") else None}
+    if role == "tool" and row.get("tool_call_id"):
+        out["tool_call_id"] = row.get("tool_call_id")
+    if role == "assistant":
+        # Providers store thinking under either column; the chat shows it collapsed ("생각함").
+        reasoning = row.get("reasoning") or row.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning.strip():
+            out["reasoning"] = trim(reasoning, MSG_CONTENT_MAX)
+    if isinstance(row.get("attachments"), list):
+        out["attachments"] = row["attachments"]
+    return out
 
 
 # --- manager -----------------------------------------------------------------------------
@@ -176,7 +298,30 @@ class SessionManager:
         self._locks: dict[str, asyncio.Lock] = {}
         self._recent_done: OrderedDict[str, dict] = OrderedDict()
         self._tasks = TaskSet("sessions")
+        # Index hooks (wired by the agent): a watched session's row changed / a new message.
+        self.on_live_change: Callable[[str, bool], None] = lambda sid, activity_only: None
+        self.on_message: Callable[[str, str, str | None, str | None], None] = lambda *a: None
+        self.on_rotate: Callable[[str, str], None] = lambda old, new: None
+        self.on_sessions_changed: Callable[[], None] = lambda: None
+        self.cost_for: Callable[[str], dict[str, Any] | None] = lambda sid: None
         self._restore_from_state()
+
+    @property
+    def drafts(self) -> dict[str, dict[str, Any]]:
+        """Sessions created here that have no database row yet (untitled, no prompt sent)."""
+        return self.state.drafts
+
+    def drop_draft(self, sid: str) -> None:
+        if self.state.drafts.pop(sid, None) is not None:
+            self.state.mark_dirty()
+
+    def shown_title(self, sid: str, title: str | None) -> str | None:
+        """The title to show: while a Korean title hint is open, a title without Hangul (Hermes'
+        English auto-title, about to be replaced) is shown as the hint (omni/link/titles.py)."""
+        hint = self.state.title_hints.get(sid)
+        if hint and title and not has_hangul(title):
+            return hint.get("title") or title
+        return title
 
     def bind(self, hermes: HermesClient) -> None:
         self.hermes = hermes
@@ -261,14 +406,12 @@ class SessionManager:
         self.by_stored[new_stored] = a
         self.state.rename_stored(old, new_stored)
         self.emit(ev("session.tip", old=old, new=new_stored))
+        self.on_rotate(old, new_stored)
 
     def _set_seq(self, a: Attached, seq: int) -> None:
         a.last_seq = seq
         self.state.last_seq[a.stored_id] = seq
         self.state.mark_dirty()
-
-    def canonical_ids(self) -> set[str]:
-        return {e["stored_id"] for e in self.state.canonical.values() if e.get("stored_id")}
 
     # --- attach / resume -----------------------------------------------------------------
     async def attach(self, stored_id: str, *, refresh: bool = True) -> tuple[Attached, dict[str, Any]]:
@@ -303,7 +446,13 @@ class SessionManager:
             res = await h.call("session.resume", {"session_id": a.stored_id, "omit_messages": True}, timeout=60)
         except HermesError as e:
             if e.code in STALE_SESSION_CODES:
+                if a.stored_id in self.drafts:
+                    self.drop_draft(a.stored_id)   # an untitled draft dies with its runtime
+                    self.on_sessions_changed()
                 raise SessionOpError("not_found", f"session {a.stored_id} not found") from e
+            locked = locked_error(e)
+            if locked is not None:
+                raise locked from e
             raise
         rid = res.get("session_id")
         if not rid:
@@ -323,7 +472,12 @@ class SessionManager:
         if same_stream and a.last_seq > 0:
             await self._gap_fill(a)
         self._absorb_open_requests(a, res.get("open_requests") or [])
-        self.emit(ev("session.state", stored_id=a.stored_id, running=a.running, cwd=a.cwd))
+        self._emit_state(a, cwd=a.cwd)
+        self.on_live_change(a.stored_id, False)
+        model = info.get("model")
+        if isinstance(model, str) and model:
+            self._merge_meta(a, {"model": model})
+        self._tasks.spawn(self._refresh_usage(a.stored_id), name=f"usage-{a.stored_id}")
         if not same_stream and not a.running:
             # Snapshot now: a submit racing with this resume (still "submitting") is not lost.
             lost = self._lost_candidates(a.stored_id, before=resumed_at)
@@ -358,6 +512,7 @@ class SessionManager:
             req = _request_obj(rid, method, r.get("params") or {})
             a.open_requests[rid] = req
             self.emit(ev("session.request", stored_id=a.stored_id, request=req))
+            self.on_live_change(a.stored_id, False)
 
     async def on_hermes_connected(self, epoch: str | None) -> None:
         """Re-resume every watched session after (re)connecting to Hermes."""
@@ -383,6 +538,10 @@ class SessionManager:
         self.state.mark_dirty()
 
     def _forget(self, a: Attached) -> None:
+        for timer in (a.meta_timer, a.queue_timer):
+            if timer is not None:
+                timer.cancel()
+        a.meta_timer = a.queue_timer = None
         if a.runtime_id and self.by_runtime.get(a.runtime_id) is a:
             del self.by_runtime[a.runtime_id]
         self.by_stored.pop(a.stored_id, None)
@@ -394,6 +553,9 @@ class SessionManager:
     def on_event(self, params: dict[str, Any]) -> None:
         sid = params.get("session_id") or ""
         if not sid:
+            if params.get("type") == "sessions.changed":
+                self.on_sessions_changed()
+                return
             if params.get("type") == "session.reclaimed":
                 p = params.get("payload") or {}
                 a = self.by_runtime.get(str(p.get("session_id") or ""))
@@ -426,42 +588,231 @@ class SessionManager:
         if etype == "session.info":
             self._on_info(a, payload)
             return
+        if etype == "session.usage":
+            self._merge_meta(a, meta_from_usage(payload.get("usage") if isinstance(payload.get("usage"), dict)
+                                                else payload))
+            return
         if etype == "request.cancel":
             rid = payload.get("id")
             if rid and a.open_requests.pop(rid, None) is not None:
                 self.emit(ev("session.request_cancel", stored_id=a.stored_id, request_id=rid,
                              reason=payload.get("reason")))
+                self.on_live_change(a.stored_id, False)
             return
-        if etype == "message.start" and not a.running:
-            a.running = True
-            self.emit(ev("session.state", stored_id=a.stored_id, running=True))
+        if etype == "message.start":
+            self._on_turn_start(a)
         out = filter_event(etype, payload)
         if out is None:
             return
         self.emit(ev("session.event", stored_id=a.stored_id, seq=seq, type=etype, payload=out))
+        self._track_activity(a, etype, payload)
         if etype == "message.complete":
+            a.completes += 1
             for rid in list(a.open_requests):
                 a.open_requests.pop(rid, None)
                 self.emit(ev("session.request_cancel", stored_id=a.stored_id, request_id=rid, reason="turn_complete"))
+            self._merge_meta(a, meta_from_usage(payload.get("usage")))
             self._tasks.spawn(self._finish_turn(a.stored_id, payload), name=f"turn-{a.stored_id}")
+
+    def _on_turn_start(self, a: Attached) -> None:
+        was = a.running
+        a.running = True
+        a.last_turn_status = None
+        a.activity = {"kind": "thinking", "text": ""}
+        if a.queue_timer is not None:
+            a.queue_timer.cancel()
+            a.queue_timer = None
+        # A queued prompt starts only after a turn completed since it was queued (a prompt submitted
+        # as "streaming" starts right away and was never queued).
+        if a.queue and a.completes > a.queue[0]["completes"]:
+            item = a.queue.pop(0)
+            if item["kind"] == "human":
+                self._emit_queue(a)
+        if not was:
+            self._emit_state(a)
+        self.on_live_change(a.stored_id, False)
+
+    def _track_activity(self, a: Attached, etype: str, p: dict[str, Any]) -> None:
+        act: dict[str, str] | None = a.activity
+        if etype == "reasoning.delta":
+            act = {"kind": "thinking", "text": ""}
+        elif etype == "message.delta":
+            act = {"kind": "writing", "text": ""}
+        elif etype in ("tool.generating", "tool.start"):
+            act = {"kind": "tool", "text": tool_activity(p.get("name"), p.get("args"))}
+        elif etype == "message.complete":
+            act = None
+        if act != a.activity:
+            a.activity = act
+            self.on_live_change(a.stored_id, True)
+
+    def _emit_state(self, a: Attached, **extra: Any) -> None:
+        status = "waiting" if a.open_requests else ("working" if a.running else "idle")
+        self.emit(ev("session.state", stored_id=a.stored_id, running=a.running, status=status,
+                     last_turn_status=a.last_turn_status, **extra))
 
     def _on_info(self, a: Attached, p: dict[str, Any]) -> None:
         changed: dict[str, Any] = {}
         if "running" in p and bool(p["running"]) != a.running:
             a.running = bool(p["running"])
             changed["running"] = a.running
+            if not a.running:
+                a.activity = None
+                self._schedule_queue_check(a)
         title = p.get("title")
         if isinstance(title, str) and title and title != a.title:
-            a.title = changed["title"] = title
+            a.title = title
+            changed["title"] = self.shown_title(a.stored_id, title)
         cwd = p.get("cwd")
         if isinstance(cwd, str) and cwd and cwd != a.cwd:
             a.cwd = changed["cwd"] = cwd
         key = p.get("session_key")
         if isinstance(key, str) and key and key != a.stored_id:
             self._rotate(a, key)
+        self._merge_meta(a, meta_from_info(p))
         if changed:
-            changed.setdefault("running", a.running)
-            self.emit(ev("session.state", stored_id=a.stored_id, **changed))
+            changed.pop("running", None)
+            self._emit_state(a, **changed)
+            self.on_live_change(a.stored_id, False)
+
+    # --- queued prompts ------------------------------------------------------------------
+    def _schedule_queue_check(self, a: Attached) -> None:
+        if not a.queue or a.queue_timer is not None:
+            return
+
+        def check() -> None:
+            a.queue_timer = None
+            if not a.running and a.queue:
+                # Hermes drains its queue right after a turn ends, so prompts still waiting here were
+                # dropped: session.interrupt (중단, also from another window) clears Hermes' queue.
+                # The UI promised to send them after the current work, so submit them again in order.
+                items, a.queue = a.queue, []
+                log.info("session %s went idle with %d queued prompt(s) not started; resubmitting them",
+                         a.stored_id, len(items))
+                self._tasks.spawn(self._resubmit_queue(a.stored_id, items), name=f"requeue-{a.stored_id}")
+
+        a.queue_timer = asyncio.get_running_loop().call_later(QUEUE_IDLE_CLEAR_S, check)
+
+    async def _resubmit_queue(self, stored_id: str, items: list[dict[str, Any]]) -> None:
+        """Submit prompts Hermes dropped from its queue again, FIFO. The first one starts a turn, the
+        rest are queued behind it. A human prompt that cannot be submitted is reported back
+        (``session.queue {dropped}``) so the browser can return the text to the composer; a delivery
+        is settled with an error turn.done so the sender is not left waiting."""
+        dropped: list[str] = []
+        for item in items:
+            did = item.get("delivery_id")
+            if did:
+                entry = self.state.inflight.get(did)
+                if entry is None or "done" in entry:
+                    continue   # settled meanwhile (lost-delivery settlement after a Hermes restart)
+            try:
+                a, res = await self.call_session(stored_id, "prompt.submit",
+                                                 {"text": item["prompt"], "queued": True}, timeout=60)
+            except (HermesError, SessionOpError) as e:
+                log.warning("session %s: could not resubmit a queued %s prompt: %s", stored_id, item["kind"], e)
+                if isinstance(e, HermesUnavailable) and e.sent:
+                    # Outcome unknown (Hermes may hold it): never submit it a second time. A delivery
+                    # is verified against the transcript; a human prompt goes back to its author.
+                    if did:
+                        self._mark_unconfirmed(did)
+                    else:
+                        dropped.append(item["text"])
+                    continue
+                if did:
+                    self._complete_delivery(did, ev(
+                        "turn.done", stored_id=stored_id, user_row_id=None, delivery_id=did, status="error",
+                        text=None, partial=True, error="prompt_not_accepted"))
+                else:
+                    dropped.append(item["text"])
+                continue
+            status = res.get("status") or "queued"
+            row_id = res.get("user_row_id") if isinstance(res.get("user_row_id"), int) else None
+            if did and (entry := self.state.inflight.get(did)) is not None and "done" not in entry:
+                entry.update(stored_id=a.stored_id, status=status, user_row_id=row_id, submitted_at=time.time())
+                self.state.save_now()
+            if status == "queued":
+                a.queue.append({**item, "completes": a.completes})
+        # One strip update at the end: the items stay visible until they are resubmitted.
+        if any(i["kind"] == "human" for i in items):
+            extra = {"dropped": dropped} if dropped else {}
+            self.emit(ev("session.queue", stored_id=stored_id, items=self.queue_items(stored_id), **extra))
+
+    def _emit_queue(self, a: Attached) -> None:
+        items = [{"text": i["text"], "at": i["at"]} for i in a.queue if i["kind"] == "human"]
+        self.emit(ev("session.queue", stored_id=a.stored_id, items=items))
+
+    def queue_items(self, stored_id: str) -> list[dict[str, Any]]:
+        a = self.by_stored.get(stored_id)
+        return [{"text": i["text"], "at": i["at"]} for i in a.queue if i["kind"] == "human"] if a else []
+
+    # --- session.meta --------------------------------------------------------------------
+    def _merge_meta(self, a: Attached, fields: dict[str, Any]) -> None:
+        if not fields:
+            return
+        for k, v in fields.items():
+            if k == "usage" and isinstance(v, dict):
+                cur = dict(a.meta.get("usage") or {})
+                cur.update({kk: vv for kk, vv in v.items() if vv is not None})
+                a.meta["usage"] = cur
+            else:
+                a.meta[k] = v
+        self._schedule_meta(a)
+
+    def _schedule_meta(self, a: Attached) -> None:
+        if a.meta_timer is not None:
+            return
+        wait = a.meta_sent_at + META_THROTTLE_S - time.monotonic()
+        if wait <= 0:
+            self._flush_meta(a)
+        else:
+            a.meta_timer = asyncio.get_running_loop().call_later(wait, self._flush_meta, a)
+
+    def meta_for(self, stored_id: str) -> dict[str, Any] | None:
+        a = self.by_stored.get(stored_id)
+        if a is None or not a.meta:
+            return None
+        meta = {k: a.meta.get(k) for k in META_KEYS}
+        usage = dict(meta.get("usage") or {})
+        for k in ("input", "output", "total", "calls", "cache_hit_pct"):
+            usage.setdefault(k, None)
+        cost = self.cost_for(stored_id) or {}
+        usage["cost_usd"] = cost.get("cost_usd")
+        usage["cost_status"] = cost.get("cost_status")
+        meta["usage"] = usage
+        return meta
+
+    def _flush_meta(self, a: Attached) -> None:
+        a.meta_timer = None
+        meta = self.meta_for(a.stored_id)
+        if meta is None:
+            return
+        enc = json.dumps(meta, sort_keys=True, default=str)
+        if enc == a.meta_sent:
+            return
+        a.meta_sent, a.meta_sent_at = enc, time.monotonic()
+        self.emit(ev("session.meta", stored_id=a.stored_id, meta=meta))
+
+    async def _refresh_usage(self, stored_id: str) -> None:
+        a = self.by_stored.get(stored_id)
+        if a is None or not a.runtime_id:
+            return
+        try:
+            res = await self._h().call("session.usage", {"session_id": a.runtime_id}, timeout=15)
+        except HermesError as e:
+            log.debug("session.usage for %s failed: %s", stored_id, e)
+            return
+        self._merge_meta(a, meta_from_usage(res))
+
+    # --- live row state (session index) --------------------------------------------------
+    def live_row_state(self, stored_id: str) -> dict[str, Any] | None:
+        """Running/status/requests/activity of a watched session, or None if not watched."""
+        a = self.by_stored.get(stored_id)
+        if a is None or not a.runtime_id:
+            return None
+        status = "waiting" if a.open_requests else ("working" if a.running else "idle")
+        return {"running": a.running or bool(a.open_requests), "status": status,
+                "pending_requests": len(a.open_requests), "activity": a.activity if a.running else None,
+                "last_turn_status": a.last_turn_status}
 
     def on_server_request(self, frame: dict[str, Any]) -> None:
         method = frame.get("method")
@@ -476,6 +827,7 @@ class SessionManager:
         req = _request_obj(rid, method, params)
         a.open_requests[rid] = req
         self.emit(ev("session.request", stored_id=a.stored_id, request=req))
+        self.on_live_change(a.stored_id, False)
 
     # --- turn completion -----------------------------------------------------------------
     def _inflight_for(self, stored_id: str) -> list[str]:
@@ -497,6 +849,15 @@ class SessionManager:
         frame = ev("turn.done", stored_id=stored_id, user_row_id=user_row_id, delivery_id=delivery_id,
                    status=status, text=payload.get("text"),
                    partial=bool(status != "complete" or pt.get("complete") is False))
+        a = self.by_stored.get(stored_id)
+        if a is not None:
+            a.last_turn_status = status
+            a.activity = None
+            self._emit_state(a)
+            self.on_live_change(a.stored_id, False)
+        text = payload.get("text")
+        if isinstance(text, str) and text.strip():
+            self.on_message(stored_id, "assistant", text, None)
         self._complete_delivery(delivery_id, frame)
 
     def _complete_delivery(self, delivery_id: str | None, frame: dict) -> None:
@@ -609,6 +970,9 @@ class SessionManager:
                     a.runtime_id = None
                     a, _ = await self.attach(a.stored_id)
                     continue
+                locked = locked_error(e)
+                if locked is not None:
+                    raise locked from e
                 raise
         raise AssertionError("unreachable")
 
@@ -617,10 +981,48 @@ class SessionManager:
         inflight = res.get("inflight") if isinstance(res.get("inflight"), dict) else None
         if inflight is not None:
             inflight = {k: trim(to_text(inflight.get(k)), 20000) for k in ("user", "assistant") if inflight.get(k)}
-        return {"stored_id": a.stored_id, "running": a.running,
-                "open_requests": list(a.open_requests.values()), "inflight": inflight or None}
+        return {"stored_id": a.stored_id, "running": a.running, "last_seq": a.last_seq,
+                "open_requests": list(a.open_requests.values()), "inflight": inflight or None,
+                "meta": self.meta_for(a.stored_id), "queue": self.queue_items(a.stored_id),
+                "status": "waiting" if a.open_requests else ("working" if a.running else "idle"),
+                "last_turn_status": a.last_turn_status}
 
     async def prompt(self, stored_id: str, text: str, mode: str, delivery_id: str | None) -> dict[str, Any]:
+        if mode == "steer" and not delivery_id:
+            res = await self._steer(stored_id, text)
+            if res is not None:
+                return res
+            mode = "queue"   # idle (or steer unsupported): a normal prompt
+        out = await self._submit(stored_id, text, mode, delivery_id)
+        if out.get("duplicate"):
+            return out
+        a = self.by_stored.get(stored_id)
+        omni = parse_omni_header(text)
+        if out.get("status") == "queued" and a is not None:
+            a.queue.append({"kind": "delivery" if delivery_id else "human", "text": trim(text, QUEUE_TEXT_MAX),
+                            "prompt": text, "delivery_id": delivery_id, "at": time.time(),
+                            "completes": a.completes})
+            if not delivery_id:
+                self._emit_queue(a)
+        if omni is not None:
+            self.on_message(stored_id, "agent", omni["body"], omni["from_title"] or omni["from"])
+        else:
+            self.on_message(stored_id, "user", text, None)
+        return out
+
+    async def _steer(self, stored_id: str, text: str) -> dict[str, Any] | None:
+        """Steer a running turn; None when the session is idle (the caller queues a prompt instead)."""
+        try:
+            _, res = await self.call_session(stored_id, "session.steer", {"text": text}, timeout=30)
+        except HermesError as e:
+            if e.code == STEER_UNSUPPORTED:
+                return None
+            raise
+        if res.get("status") == "rejected":
+            return None
+        return {"status": "steered"}
+
+    async def _submit(self, stored_id: str, text: str, mode: str, delivery_id: str | None) -> dict[str, Any]:
         if delivery_id:
             entry = self.state.inflight.get(delivery_id)
             if entry is not None:
@@ -748,6 +1150,8 @@ class SessionManager:
         await self._h().respond(request_id, result)
         if a.open_requests.pop(request_id, None) is not None:
             self.emit(ev("session.request_cancel", stored_id=a.stored_id, request_id=request_id, reason="answered"))
+            self._emit_state(a)
+            self.on_live_change(a.stored_id, False)
 
     async def ensure_canonical(self, path: str, project_name: str) -> dict[str, Any]:
         title = canonical_title(project_name)
@@ -797,12 +1201,15 @@ class SessionManager:
         except HermesError as e:
             log.debug("session.close %s: %s", runtime_id, e)
 
-    async def create(self, path: str, title: str | None) -> dict[str, Any]:
+    async def create(self, path: str | None, title: str | None) -> dict[str, Any]:
+        """New session (in ``path``, or the node's default working directory). Hermes writes the
+        database row on the first prompt or title; until then the session is a draft of this link."""
         h = self._h()
-        res = await h.call("session.create", {"cwd": path}, timeout=60)
+        res = await h.call("session.create", {"cwd": path} if path else {}, timeout=60)
         rid, stored = res.get("session_id"), res.get("stored_session_id")
         if not rid or not stored:
             raise SessionOpError("hermes_error", "session.create returned no ids")
+        cwd = (res.get("info") or {}).get("cwd") or path
         final_title = None
         if title:
             for n in range(1, 10):
@@ -815,57 +1222,92 @@ class SessionManager:
                     if e.code != TITLE_IN_USE:
                         await self._close_runtime(rid)
                         raise
-        # Without a title the DB row appears on the first prompt; the runtime stays alive on our socket.
-        self._register(Attached(stored_id=stored, cwd=path, title=final_title), rid, h.epoch)
-        return {"stored_id": stored, "title": final_title}
+        self._register(Attached(stored_id=stored, cwd=cwd, title=final_title), rid, h.epoch)
+        if final_title is None:
+            self.state.drafts[stored] = {"cwd": cwd, "title": None, "created_at": time.time()}
+            self.state.mark_dirty()
+        self.on_sessions_changed()
+        return {"stored_id": stored, "title": final_title, "cwd": cwd}
 
-    async def rename(self, stored_id: str, title: str) -> None:
-        await self._h().rest("PATCH", f"/api/sessions/{stored_id}", json_body={"title": title})
+    async def update(self, stored_id: str, title: str | None, pinned: bool | None) -> None:
+        """Rename and/or pin. A draft (no row yet) is titled through the runtime, which creates its row."""
+        if title is not None and stored_id in self.drafts:
+            try:
+                await self.call_session(stored_id, "session.title", {"title": title})
+            except HermesError as e:
+                if e.code == TITLE_IN_USE:
+                    raise SessionOpError("duplicate_title", e.message) from e
+                raise
+            self.drop_draft(stored_id)
+            title = None
+            if pinned is None:
+                return
+        body: dict[str, Any] = {}
+        if title is not None:
+            body["title"] = title
+        if pinned is not None:
+            body["pinned"] = bool(pinned)
+        if not body:
+            return
+        try:
+            res = await self._h().rest("PATCH", f"/api/sessions/{stored_id}", json_body=body, allow_404=True)
+        except HermesError as e:
+            if e.code in (400, 409, 422, TITLE_IN_USE) and "already in use" in e.message:
+                raise SessionOpError("duplicate_title", "title already in use") from e
+            raise
+        if res is None:
+            raise SessionOpError("not_found", f"session {stored_id} not found")
         for entry in self.state.canonical.values():
-            if entry.get("stored_id") == stored_id:
+            if title is not None and entry.get("stored_id") == stored_id:
                 entry["title"] = title
                 self.state.mark_dirty()
 
+    async def retitle(self, stored_id: str, title: str, attempts: int = 9) -> str | None:
+        """Rename to ``title``, numbered " (2)", " (3)"… while the name is taken (titles are unique per
+        database). Returns the title set, or None when every candidate was taken."""
+        for n in range(1, attempts + 1):
+            candidate = title if n == 1 else f"{title} ({n})"
+            try:
+                await self.update(stored_id, candidate, None)
+                return candidate
+            except SessionOpError as e:
+                if e.code != "duplicate_title":
+                    raise
+        return None
+
     async def delete(self, stored_id: str) -> None:
         a = self.by_stored.get(stored_id)
+        if a is not None and (a.running or a.open_requests):
+            raise SessionOpError("running", "the session is running; stop it first")
+        if a is None and (await self.live_status()).get(stored_id) in ("working", "waiting"):
+            raise SessionOpError("running", "the session is running; stop it first")
         if a is not None:
             if a.runtime_id:
                 await self._close_runtime(a.runtime_id)
             self._forget(a)
+        self.drop_draft(stored_id)
         await self._h().rest("DELETE", f"/api/sessions/{stored_id}", allow_404=True)
         for path, entry in list(self.state.canonical.items()):
             if entry.get("stored_id") == stored_id:
                 self.state.drop_canonical(path)
 
-    async def messages(self, stored_id: str, limit: int) -> list[dict[str, Any]]:
-        """The newest ``limit`` rows (≤ MESSAGES_MAX), ascending. Hermes serves at most
-        HERMES_PAGE_MAX rows per request; ``order=latest&offset=N`` pages further back."""
+    async def messages(self, stored_id: str, limit: int, offset: int = 0) -> dict[str, Any]:
+        """A page of the transcript, ascending: the ``limit`` rows before the newest ``offset`` rows.
+        ``has_more`` tells whether older rows exist."""
         limit = max(1, min(limit, MESSAGES_MAX))
-        rows: list[dict[str, Any]] = []
-        offset = 0
-        while offset < limit:
-            size = min(HERMES_PAGE_MAX, limit - offset)
-            page = await self._h().rest("GET", f"/api/sessions/{stored_id}/messages",
-                                        params={"limit": str(size), "offset": str(offset), "order": "latest"},
-                                        allow_404=True)
-            if page is None:
-                if offset == 0:
-                    raise SessionOpError("not_found", f"session {stored_id} not found")
-                break
-            batch = page.get("messages") or []
-            rows[:0] = batch    # older page goes in front
-            if len(batch) < size:
-                break
-            offset += size
-        seen: set[Any] = set()
-        out = []
-        for r in rows:   # a row appended between page reads can show up twice
-            rid = r.get("id")
-            if rid is not None and rid in seen:
-                continue
-            seen.add(rid)
-            out.append(map_message(r))
-        return out
+        offset = max(0, offset)
+        size = min(limit + 1, HERMES_PAGE_MAX)
+        page = await self._h().rest("GET", f"/api/sessions/{stored_id}/messages",
+                                    params={"limit": str(size), "offset": str(offset), "order": "latest"},
+                                    allow_404=True)
+        if page is None:
+            if stored_id in self.drafts:
+                return {"messages": [], "has_more": False}
+            raise SessionOpError("not_found", f"session {stored_id} not found")
+        rows = page.get("messages") or []
+        has_more = len(rows) > limit or (len(rows) == size and size < limit + 1)
+        rows = rows[-limit:]
+        return {"messages": [map_message(r) for r in rows], "has_more": has_more}
 
     async def live_status(self) -> dict[str, str]:
         """stored id → live status (working|waiting|idle) for sessions live in Hermes."""
@@ -886,37 +1328,6 @@ class SessionManager:
         if a is not None and a.runtime_id:
             return a.running
         return live.get(stored_id) in ("working", "waiting")
-
-    async def fetch_sessions(self, cwd_prefix: str | None, limit: int, max_pages: int = 1) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        params: dict[str, str] = {"limit": str(max(1, min(limit, 100))), "order": "recent", "archived": "exclude"}
-        if cwd_prefix:
-            params["cwd_prefix"] = cwd_prefix
-        for page in range(max_pages):
-            params["offset"] = str(page * int(params["limit"]))
-            res = await self._h().rest("GET", "/api/sessions", params=params)
-            batch = res.get("sessions") or []
-            rows.extend(batch)
-            if len(batch) < int(params["limit"]):
-                break
-        return rows
-
-    async def list_sessions(self, path: str | None, limit: int) -> list[dict[str, Any]]:
-        rows = await self.fetch_sessions(path, max(limit, 100) if path else limit)
-        live = await self.live_status()
-        canon = self.canonical_ids()
-        out = []
-        for r in rows:
-            if path and r.get("cwd") != path:
-                continue
-            sid = r.get("id")
-            out.append({"stored_id": sid, "title": r.get("title"), "cwd": r.get("cwd"), "source": r.get("source"),
-                        "last_active": r.get("last_activity_at") or r.get("last_active"),
-                        "started_at": r.get("started_at"), "message_count": r.get("message_count"),
-                        "running": self.is_running(sid, live), "canonical": sid in canon})
-            if len(out) >= limit:
-                break
-        return out
 
     async def session_cwd(self, stored_id: str) -> str | None:
         a = self.by_stored.get(stored_id)

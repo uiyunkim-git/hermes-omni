@@ -17,16 +17,19 @@ import android.webkit.CookieManager;
 import android.webkit.URLUtil;
 import android.widget.Toast;
 
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 
 /**
  * WebView downloads via the system DownloadManager, forwarding the hub session cookie.
  *
- * <p>APK downloads (the hub's /app/hermes-omni.apk self-update) are handed to the package
- * installer as soon as they complete, while the activity is alive; otherwise the user can tap the
- * completed-download notification.
+ * <p>Every download is a plain hub GET URL (the web UI never hands out blob:/data: URLs). The
+ * completed-download notification opens the file; while the activity is alive a toast confirms
+ * completion. APK downloads (the hub's /app/hermes-omni.apk self-update) are handed to the package
+ * installer as soon as they complete.
  */
 final class Downloader {
   private static final String TAG = "HermesOmni";
@@ -34,13 +37,17 @@ final class Downloader {
 
   private final Activity activity;
   private final DownloadManager dm;
+  /** Downloads enqueued by this activity: id -> file name. */
+  private final Map<Long, String> pending = new HashMap<>();
   private final Set<Long> pendingApks = new HashSet<>();
   private boolean registered;
 
   private final BroadcastReceiver onComplete = new BroadcastReceiver() {
     @Override public void onReceive(Context context, Intent intent) {
       long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1);
-      if (id != -1 && pendingApks.remove(id)) onApkDownloaded(id);
+      String name = pending.remove(id);
+      boolean apk = pendingApks.remove(id);
+      if (name != null) onDownloaded(id, name, apk);
     }
   };
 
@@ -79,18 +86,19 @@ final class Downloader {
       toast(activity.getString(R.string.download_unsupported));
       return;
     }
-    String name = URLUtil.guessFileName(url, contentDisposition, mimeType);
+    String name = FileNames.fromContentDisposition(contentDisposition);
+    if (name == null) name = FileNames.sanitize(URLUtil.guessFileName(url, contentDisposition, mimeType));
+    if (name == null) name = "download";
     boolean apk = APK_MIME.equals(mimeType) || name.toLowerCase(Locale.ROOT).endsWith(".apk");
-    if (apk && !name.toLowerCase(Locale.ROOT).endsWith(".apk")) {
-      name = name.replaceFirst("\\.[^.]*$", "") + ".apk";
-    }
+    if (apk) name = FileNames.withApkExtension(name);
 
     DownloadManager.Request r = new DownloadManager.Request(uri);
     String cookies = CookieManager.getInstance().getCookie(url);
     if (cookies != null && !cookies.isEmpty()) r.addRequestHeader("Cookie", cookies);
     if (userAgent != null) r.addRequestHeader("User-Agent", userAgent);
     r.setTitle(name);
-    r.setMimeType(apk ? APK_MIME : mimeType);
+    if (apk) r.setMimeType(APK_MIME);
+    else if (mimeType != null && !mimeType.isEmpty()) r.setMimeType(mimeType);
     r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
       r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);
@@ -100,6 +108,7 @@ final class Downloader {
     }
     try {
       long id = dm.enqueue(r);
+      pending.put(id, name);
       if (apk) pendingApks.add(id);
       Log.i(TAG, "download #" + id + " " + name);
       toast(activity.getString(R.string.download_started, name));
@@ -109,7 +118,7 @@ final class Downloader {
     }
   }
 
-  private void onApkDownloaded(long id) {
+  private void onDownloaded(long id, String name, boolean apk) {
     int status = -1;
     int reason = 0;
     try (Cursor c = dm.query(new DownloadManager.Query().setFilterById(id))) {
@@ -117,10 +126,19 @@ final class Downloader {
         status = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS));
         reason = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON));
       }
+    } catch (RuntimeException e) {
+      Log.w(TAG, "download #" + id + " query failed", e);
     }
     if (status != DownloadManager.STATUS_SUCCESSFUL) {
-      Log.w(TAG, "apk download #" + id + " failed: status=" + status + " reason=" + reason);
-      toast(activity.getString(R.string.download_failed, "#" + reason));
+      // status -1: the user removed it from the notification before it finished.
+      if (status != -1) {
+        Log.w(TAG, "download #" + id + " failed: status=" + status + " reason=" + reason);
+        toast(activity.getString(R.string.download_failed, name));
+      }
+      return;
+    }
+    if (!apk) {
+      toast(activity.getString(R.string.download_done, name));
       return;
     }
     Uri file = dm.getUriForDownloadedFile(id);
@@ -132,6 +150,7 @@ final class Downloader {
       activity.startActivity(install);
     } catch (ActivityNotFoundException e) {
       Log.w(TAG, "no package installer", e);
+      toast(activity.getString(R.string.download_done, name));
     }
   }
 

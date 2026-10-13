@@ -1,29 +1,36 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
   <string name="hub_dialog_title">Hub address</string>
-  <string name="hub_dialog_message">Enter the Hermes Omni hub URL.\ne.g. http://hub-name.tailnet.ts.net</string>
+  <string name="hub_dialog_message">Enter the Hermes hub address.\ne.g. http://hub.tailnet.ts.net</string>
   <string name="hub_dialog_connect">Connect</string>
   <string name="hub_url_invalid">Enter an http:// or https:// address</string>
   <string name="hub_warn_title">Not a Tailscale address</string>
   <string name="hub_warn_message">%1$s is not a Tailscale (*.ts.net, 100.64.0.0/10) or LAN address. Use it anyway?</string>
   <string name="hub_warn_use">Use</string>
-
+  <string name="change_hub">Change hub address</string>
   <string name="cancel">Cancel</string>
 
-  <string name="menu_change_hub">Change hub URL</string>
   <string name="menu_reload">Reload</string>
-  <string name="menu_clear_cookies">Clear cookies (log out)</string>
+  <string name="menu_clear_cookies">Log out and clear data</string>
   <string name="clear_cookies_message">Delete login cookies and stored web data?</string>
   <string name="clear_cookies_confirm">Delete</string>
   <string name="cookies_cleared">Logged out</string>
 
-  <string name="error_title">Cannot reach the hub</string>
-  <string name="error_hint">Tailscale 연결을 확인하세요 (check your Tailscale connection)</string>
-  <string name="error_retry">Retry</string>
+  <string name="error_title">Can\'t reach the hub</string>
+  <string name="error_hint">Check that Tailscale is on. The app retries automatically once you\'re connected.</string>
+  <string name="error_retry">Try again</string>
 
   <string name="copied">Copied</string>
+  <string name="choose_file">Choose a file</string>
+  <string name="no_file_picker">No app can pick files</string>
   <string name="download_started">Downloading: %1$s</string>
+  <string name="download_done">Downloaded: %1$s</string>
   <string name="download_failed">Download failed: %1$s</string>
-  <string name="download_unsupported">This kind of download is not supported</string>
+  <string name="download_unsupported">This can\'t be downloaded</string>
   <string name="no_app_for_link">No app can open this link</string>
+
+  <string name="update_title">A new version is available</string>
+  <string name="update_now">Update</string>
+  <string name="update_later">Later</string>
+  <string name="update_skip">Skip this version</string>
 </resources>

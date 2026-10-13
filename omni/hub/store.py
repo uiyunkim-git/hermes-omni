@@ -1,4 +1,4 @@
-"""SQLite persistence for the hub (design §6): nodes and deliveries.
+"""SQLite persistence for the hub (design §6, v3 §5.3): nodes, their session index and deliveries.
 
 All methods are synchronous and must be called through `Store.run()`, which executes them on
 a single dedicated worker thread. That serialises access to the one sqlite3 connection and
@@ -59,13 +59,28 @@ MIGRATIONS: list[str] = [
     CREATE INDEX deliveries_from ON deliveries(from_node, from_stored);
     CREATE INDEX deliveries_created ON deliveries(created_at);
     """,
+    # v2 -> v3: the session index of every node, delivery titles and conversations.
+    """
+    CREATE TABLE node_sessions (
+        node_id    TEXT NOT NULL,
+        stored_id  TEXT NOT NULL,
+        row_json   TEXT NOT NULL,
+        updated_at REAL NOT NULL,
+        PRIMARY KEY (node_id, stored_id)
+    );
+    ALTER TABLE deliveries ADD COLUMN from_title TEXT;
+    ALTER TABLE deliveries ADD COLUMN to_title TEXT;
+    ALTER TABLE deliveries ADD COLUMN conv_id TEXT;
+    CREATE INDEX deliveries_conv ON deliveries(conv_id);
+    """,
 ]
 
 ACTIVE_STATUSES = ("queued", "dispatched")
 DELIVERY_COLUMNS = (
     "id", "kind", "parent_id", "from_node", "from_stored", "from_addr", "to_node", "to_addr",
     "to_path", "to_stored", "message", "reply", "status", "expect_reply", "wait", "chain_json",
-    "error", "created_at", "updated_at", "user_row_id", "partial", "dispatched_at",
+    "error", "created_at", "updated_at", "user_row_id", "partial", "dispatched_at", "from_title", "to_title",
+    "conv_id",
 )
 
 
@@ -148,9 +163,58 @@ class Store:
     def delete_node(self, node_id: str) -> None:
         """Forget a node. Its delivery history stays; undelivered work to it is cancelled."""
         self.db.execute("DELETE FROM nodes WHERE node_id=?", (node_id,))
+        self.db.execute("DELETE FROM node_sessions WHERE node_id=?", (node_id,))
         self.db.execute(
             "UPDATE deliveries SET status='cancelled', error='node_forgotten', updated_at=? "
             "WHERE to_node=? AND status IN ('queued','dispatched')", (time.time(), node_id))
+
+    # --- session index ---------------------------------------------------------------
+    def load_node_sessions(self) -> list[tuple[str, str, dict[str, Any]]]:
+        out = []
+        for r in self.db.execute("SELECT node_id, stored_id, row_json FROM node_sessions"):
+            try:
+                row = json.loads(r["row_json"])
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                out.append((r["node_id"], r["stored_id"], row))
+        return out
+
+    def replace_node_sessions(self, node_id: str, rows: list[dict[str, Any]]) -> None:
+        now = time.time()
+        self.db.execute("BEGIN")
+        try:
+            self.db.execute("DELETE FROM node_sessions WHERE node_id=?", (node_id,))
+            self.db.executemany(
+                "INSERT OR REPLACE INTO node_sessions(node_id, stored_id, row_json, updated_at) VALUES (?,?,?,?)",
+                [(node_id, r["stored_id"], json.dumps(r, ensure_ascii=False), now) for r in rows])
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+
+    def upsert_node_sessions(self, node_id: str, rows: list[dict[str, Any]], remove: list[str]) -> None:
+        now = time.time()
+        self.db.execute("BEGIN")
+        try:
+            self.db.executemany(
+                "INSERT OR REPLACE INTO node_sessions(node_id, stored_id, row_json, updated_at) VALUES (?,?,?,?)",
+                [(node_id, r["stored_id"], json.dumps(r, ensure_ascii=False), now) for r in rows])
+            self.db.executemany("DELETE FROM node_sessions WHERE node_id=? AND stored_id=?",
+                                [(node_id, s) for s in remove])
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+
+    def count_pair_messages(self, conv_id: str, a: tuple[str, str], b: tuple[str, str]) -> int:
+        """kind='message' deliveries between sessions a and b (either direction) in a conversation."""
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM deliveries WHERE conv_id=? AND kind='message' AND status!='cancelled' AND ("
+            "(from_node=? AND from_stored=? AND to_node=? AND to_stored=?) OR "
+            "(from_node=? AND from_stored=? AND to_node=? AND to_stored=?))",
+            (conv_id, a[0], a[1], b[0], b[1], b[0], b[1], a[0], a[1])).fetchone()
+        return int(row[0])
 
     # --- deliveries ------------------------------------------------------------------
     def insert_delivery(self, d: dict[str, Any]) -> bool:

@@ -4,7 +4,8 @@
   `omni_session` cookie and as a bearer token (`Authorization: Bearer` or `/ws?token=`).
 - Login rate limit: 10 attempts / 60 s / client IP.
 - CSRF: non-GET /api/* and the /ws upgrade require a same-origin Origin (when present);
-  /api mutations also require `X-Omni: 1` and a JSON body (when a body is sent).
+  /api mutations also require `X-Omni: 1` and a JSON body (when a body is sent; the two upload
+  routes take multipart/form-data instead).
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import time
 from collections import deque
 from typing import Awaitable, Callable
@@ -37,6 +39,8 @@ PUBLIC_API = {"/api/login", "/api/logout"}
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 USER_KEY = "omni_user"  # request[USER_KEY] -> authenticated user name
+# Upload routes take multipart bodies (still behind the X-Omni header and the origin check).
+MULTIPART_PATH_RE = re.compile(r"^/api/nodes/[^/]+/(files/upload|sessions/[^/]+/attachments)$")
 
 Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 
@@ -152,7 +156,8 @@ class Auth:
                     return json_error(403, "bad_origin", "cross-origin request refused")
                 if request.headers.get(HEADER_CSRF) != "1":
                     return json_error(403, "csrf", f"missing {HEADER_CSRF}: 1 header")
-                if request.can_read_body and request.content_type != "application/json":
+                if request.can_read_body and request.content_type != "application/json" and not (
+                        request.content_type == "multipart/form-data" and MULTIPART_PATH_RE.match(path)):
                     return json_error(415, "json_required", "request body must be application/json")
             if path not in PUBLIC_API:
                 user = self.request_user(request)

@@ -10,7 +10,7 @@ import android.webkit.JavascriptInterface;
 import android.widget.Toast;
 
 /**
- * JavaScript bridge exposed to the hub web UI as {@code window.HermesOmni}.
+ * JavaScript bridge exposed to the hub web UI as {@code window.HermesOmni} (spec §5c.11).
  *
  * <p>addJavascriptInterface injects the object into every frame, so each method checks {@link
  * #enabled}, which MainActivity keeps true only while the main frame shows the configured hub
@@ -22,11 +22,22 @@ final class OmniBridge {
   private static final String TAG = "HermesOmni";
   private static final int MAX_COPY_CHARS = 1_000_000;
 
+  /** Native actions the bridge forwards to the activity (always called on the main thread). */
+  interface Host {
+    void applyBars(int color, boolean lightBackground);
+
+    void showHubDialog();
+
+    void showShellMenu();
+  }
+
   private final Activity activity;
+  private final Host host;
   private volatile boolean enabled;
 
-  OmniBridge(Activity activity) {
+  <T extends Activity & Host> OmniBridge(T activity) {
     this.activity = activity;
+    this.host = activity;
   }
 
   void setEnabled(boolean enabled) {
@@ -41,7 +52,7 @@ final class OmniBridge {
     activity.runOnUiThread(() -> {
       try {
         ClipboardManager cm = (ClipboardManager) activity.getSystemService(Context.CLIPBOARD_SERVICE);
-        cm.setPrimaryClip(ClipData.newPlainText("Hermes Omni", value));
+        cm.setPrimaryClip(ClipData.newPlainText("Hermes", value));
         // Android 13+ shows its own clipboard confirmation.
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
           Toast.makeText(activity, R.string.copied, Toast.LENGTH_SHORT).show();
@@ -65,9 +76,44 @@ final class OmniBridge {
     return enabled ? BuildConfig.VERSION_CODE : 0;
   }
 
-  /** Opens the native options menu (Change hub URL / Reload / Clear cookies). */
+  /**
+   * Colors the status and navigation bars to match the page background (the web calls this on
+   * load and on every theme change with its current --bg).
+   *
+   * @param hexColor {@code #RRGGBB}; anything else is ignored
+   * @param lightBackground true when the color is light, so the bar icons must be dark
+   * @return whether the color was accepted
+   */
+  @JavascriptInterface
+  public boolean setBars(String hexColor, boolean lightBackground) {
+    if (!enabled) return false;
+    Integer color = parseRgb(hexColor);
+    if (color == null) return false;
+    activity.runOnUiThread(() -> host.applyBars(color, lightBackground));
+    return true;
+  }
+
+  /** Opens the native hub-address dialog (Settings › 앱 › 허브 주소 변경). */
+  @JavascriptInterface
+  public void changeHubUrl() {
+    if (enabled) activity.runOnUiThread(host::showHubDialog);
+  }
+
+  /** Opens the native shell menu (reload / hub address / log out). Kept for older web builds. */
   @JavascriptInterface
   public void openMenu() {
-    if (enabled) activity.runOnUiThread(activity::openOptionsMenu);
+    if (enabled) activity.runOnUiThread(host::showShellMenu);
+  }
+
+  /** Parses {@code #RRGGBB} into an opaque ARGB int, or null. */
+  static Integer parseRgb(String s) {
+    if (s == null || s.length() != 7 || s.charAt(0) != '#') return null;
+    int rgb = 0;
+    for (int i = 1; i < 7; i++) {
+      int d = Character.digit(s.charAt(i), 16);
+      if (d < 0) return null;
+      rgb = (rgb << 4) | d;
+    }
+    return 0xFF000000 | rgb;
   }
 }

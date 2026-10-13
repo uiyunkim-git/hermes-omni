@@ -1,44 +1,27 @@
 <!doctype html>
-<html lang="en">
+<html lang="ko">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-  <meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">
-  <meta name="theme-color" content="#111317" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#FAF9F6">
   <meta name="color-scheme" content="light dark">
   <meta name="referrer" content="same-origin">
-  <title>Hermes Omni</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%235b6cff'/%3E%3Cpath d='M9 16h14M16 9v14' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+  <meta name="format-detection" content="telephone=no">
+  <title>Hermes</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231F1E1B'/%3E%3Cpath d='M11 9v14M21 9v14M11 16h10' stroke='%23D97A50' stroke-width='2.6' stroke-linecap='round' fill='none'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/assets/style.css">
   <script type="module" src="/assets/app.js"></script>
 </head>
 <body>
-  <a class="skip-link" href="#main">Skip to content</a>
-  <header class="topbar" id="topbar">
-    <div class="topbar-row">
-      <a class="brand" href="#/" aria-label="Hermes Omni home">
-        <span class="brand-mark" aria-hidden="true"></span>
-        <span class="brand-text">Hermes Omni</span>
-      </a>
-      <span class="spacer"></span>
-      <span class="conn" id="conn" role="status" aria-live="polite" data-state="closed">
-        <span class="conn-dot" aria-hidden="true"></span><span class="conn-label">Offline</span>
-      </span>
-      <a class="req-badge" id="req-badge" href="#/requests" aria-label="Pending requests: 0" hidden>
-        <span aria-hidden="true">!</span><span class="req-count">0</span>
-      </a>
-    </div>
-    <nav class="tabs" id="tabs" aria-label="Main">
-      <a href="#/" data-tab="nodes">Nodes</a>
-      <a href="#/messages" data-tab="messages">Messages</a>
-      <a href="#/requests" data-tab="requests">Requests</a>
-      <a href="#/join" data-tab="join">Join</a>
-    </nav>
-  </header>
-  <main id="main" tabindex="-1">
-    <noscript><p class="pad">Hermes Omni needs JavaScript.</p></noscript>
-    <div class="boot" aria-busy="true"><span class="spinner" aria-hidden="true"></span> Loading…</div>
-  </main>
-  <div class="toasts" id="toasts" role="region" aria-live="polite" aria-label="Notifications"></div>
+  <div id="app" class="app" data-pane="list" hidden>
+    <aside id="list-pane" class="pane list-pane" aria-label="세션 목록"></aside>
+    <main id="main-pane" class="pane main-pane"></main>
+  </div>
+  <div id="login-root" hidden></div>
+  <div id="conn-bar" class="conn-bar" role="status" aria-live="polite" hidden></div>
+  <div id="layers"></div>
+  <div id="toast-host" class="toast-host" aria-live="polite"></div>
+  <div id="boot" class="boot" aria-busy="true"><span class="spinner s20" aria-hidden="true"></span></div>
+  <noscript><p class="boot">Hermes를 쓰려면 JavaScript가 필요해요.</p></noscript>
 </body>
 </html>

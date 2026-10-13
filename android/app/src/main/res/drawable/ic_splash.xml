@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The mark in the UI icon style (24 grid, 1.75 stroke, round caps), in the theme text color.
+     Same "H" geometry as the launcher icon. Used by the launch window and the error screen. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+  <path android:strokeColor="@color/text_primary" android:strokeWidth="1.75"
+      android:strokeLineCap="round" android:strokeLineJoin="round"
+      android:pathData="M7,5 L7,19 M17,5 L17,19 M7,11.75 L17,11.75" />
+</vector>

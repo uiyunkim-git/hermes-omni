@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 from aiohttp import WSMsgType, web
 
 from omni import PROTO, __version__
-from omni.proto import (HEADER_NODE, HEADER_PROTO, NODE_ID_RE, OFFLINE_AFTER, PING_INTERVAL,
+from omni.proto import (HEADER_NODE, HEADER_PROTO, NODE_ID_RE, OFFLINE_AFTER, PING_INTERVAL, PROTO_MIN,
                         RemoteError, req, res_err, res_ok)
 
 from .store import Store
@@ -29,6 +29,7 @@ from .store import Store
 if TYPE_CHECKING:
     from .live import Live
     from .router import Router
+    from .sessions import SessionIndex
 
 log = logging.getLogger("omni.hub.links")
 
@@ -61,7 +62,8 @@ class NodeState:
         out = dict(self.info)
         out["node_id"] = self.node_id
         out.setdefault("display_name", self.node_id)
-        out.setdefault("projects", [])
+        out["projects"] = [{k: v for k, v in p.items() if k != "canonical"}
+                           for p in out.get("projects") or [] if isinstance(p, dict)]
         out["online"] = self.online
         out["last_seen"] = self.last_seen
         return out
@@ -78,8 +80,9 @@ class NodeState:
 
 
 class LinkConnection:
-    def __init__(self, node_id: str, ws: web.WebSocketResponse, remote: str | None):
+    def __init__(self, node_id: str, ws: web.WebSocketResponse, remote: str | None, proto: int = PROTO):
         self.node_id = node_id
+        self.proto = proto
         self.ws = ws
         self.remote = remote
         self.connected_at = time.time()
@@ -118,7 +121,8 @@ class LinkConnection:
             fut.set_result(result if isinstance(result, dict) else {})
         else:
             err = frame.get("error") or {}
-            fut.set_exception(RemoteError(str(err.get("code", "error")), str(err.get("message", ""))))
+            extra = {k: v for k, v in err.items() if k not in ("code", "message")} if isinstance(err, dict) else {}
+            fut.set_exception(RemoteError(str(err.get("code", "error")), str(err.get("message", "")), **extra))
 
     def spawn(self, coro: Any) -> None:
         t = asyncio.create_task(coro)
@@ -150,6 +154,7 @@ class LinkManager:
         # Wired by the server after construction.
         self.router: Router
         self.live: Live
+        self.index: SessionIndex
         self._watchdog: asyncio.Task[None] | None = None
 
     # --- lifecycle -------------------------------------------------------------------
@@ -199,6 +204,7 @@ class LinkManager:
             return False
         del self.nodes[node_id]
         await self.store.run(self.store.delete_node, node_id)
+        await self.index.forget_node(node_id)
         log.info("node %s forgotten", node_id)
         self.live.nodes_changed()
         return True
@@ -240,15 +246,16 @@ class LinkManager:
         node_id = (request.headers.get(HEADER_NODE) or "").strip().lower()
         if not NODE_ID_RE.match(node_id):
             return web.json_response({"error": f"bad or missing {HEADER_NODE}"}, status=400)
-        proto = request.headers.get(HEADER_PROTO, "")
-        if proto != str(PROTO):
+        raw_proto = request.headers.get(HEADER_PROTO, "")
+        proto = int(raw_proto) if raw_proto.isdigit() else 0
+        if not PROTO_MIN <= proto <= PROTO:
             return web.json_response(
-                {"error": f"protocol mismatch: hub speaks proto {PROTO}, link sent {proto or 'none'}; "
+                {"error": f"protocol mismatch: hub speaks proto {PROTO_MIN}..{PROTO}, link sent {raw_proto or 'none'}; "
                           "update hermes-omni on this node (git pull && ./setup.sh)"}, status=426)
 
         ws = web.WebSocketResponse(heartbeat=None, max_msg_size=MAX_MSG, autoping=True)
         await ws.prepare(request)
-        conn = LinkConnection(node_id, ws, request.remote)
+        conn = LinkConnection(node_id, ws, request.remote, proto)
         try:
             hello = await self._read_hello(conn)
             if hello is None:
@@ -288,6 +295,7 @@ class LinkManager:
         now = time.time()
         st = self.nodes.get(node_id) or NodeState(node_id, first_seen=now)
         st.info = _clean_info(node_id, hello["node"])
+        st.info["proto"] = conn.proto
         st.online = True
         st.last_seen = now
         self.nodes[node_id] = st
@@ -301,6 +309,9 @@ class LinkManager:
                  len(st.info.get("projects") or []), len(inflight))
         self.live.nodes_changed()
         self.live.on_link_up(node_id)
+        self.index.node_changed(node_id)
+        if conn.proto < 2:
+            _background(self.index.poll_legacy(node_id))
         self.router.kick()
 
     async def _unregister(self, conn: LinkConnection) -> None:
@@ -315,6 +326,7 @@ class LinkManager:
         await self.store.run(self.store.set_node_online, conn.node_id, False, now)
         log.info("node %s offline", conn.node_id)
         self.live.nodes_changed()
+        self.index.node_changed(conn.node_id)
 
     async def _ping(self, conn: LinkConnection) -> None:
         while not conn.closed:
@@ -359,12 +371,16 @@ class LinkManager:
             return
         st = self.nodes[conn.node_id]
         new = _clean_info(conn.node_id, info)
+        new["proto"] = conn.proto
         st.last_seen = time.time()
         changed = new != st.info
+        renamed = new.get("display_name") != st.info.get("display_name")
         st.info = new
         await self.store.run(self.store.upsert_node, conn.node_id, st.info, True, st.last_seen)
         if changed:
             self.live.nodes_changed()
+        if renamed:
+            self.index.node_changed(conn.node_id)
 
     async def _on_event(self, conn: LinkConnection, frame: dict[str, Any]) -> None:
         node = conn.node_id
@@ -374,8 +390,13 @@ class LinkManager:
             if isinstance(old, str) and isinstance(new, str):
                 await self.on_session_tip(node, old, new)
             return
-        if kind not in ("session.event", "session.state", "session.request",
-                        "session.request_cancel", "turn.done"):
+        if kind == "sessions.update":
+            upsert, remove = frame.get("upsert"), frame.get("remove")
+            await self.index.on_update(node, bool(frame.get("full")), upsert if isinstance(upsert, list) else [],
+                                       remove if isinstance(remove, list) else [])
+            return
+        if kind not in ("session.event", "session.state", "session.request", "session.request_cancel",
+                        "session.meta", "session.queue", "turn.done"):
             log.debug("node %s: unknown event kind %r", node, kind)
             return
         if not isinstance(frame.get("stored_id"), str):

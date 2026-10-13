@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Launch window background: surface color with the mark centered. The 84dp box puts the mark at
+     the size and place of the API 31+ splash mark, so nothing jumps when the splash fades. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+  <item android:drawable="@color/surface" />
+  <item android:drawable="@drawable/ic_splash" android:gravity="center"
+      android:width="84dp" android:height="84dp" />
+</layer-list>

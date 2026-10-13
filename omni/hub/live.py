@@ -1,10 +1,12 @@
-"""Browser live channel (/ws) and per-session live buffers (design §6).
+"""Browser live channel (/ws) and per-session live buffers (design §6, v3 spec §5.6).
 
 The hub keeps, per (node, stored_id), the in-progress turn (text, reasoning tail, tool chips),
-the running flag and the open server requests, built from forwarded link events. A browser
-`sub` makes the hub call link `session.attach` and then sends a `session.snapshot`; afterwards
-events for that session are fanned out to every subscribed browser. Each browser has its own
-bounded outbound queue so a slow client never stalls the link reader.
+the running flag, the open server requests, the last ``session.meta``, the queued prompts and a
+``locked`` marker (the session is open in another Hermes window), built from forwarded link events.
+A browser `sub` makes the hub call link `session.attach` and then sends a `session.snapshot`;
+afterwards events for that session are fanned out to every subscribed browser. Every browser also
+gets the session list (`sessions` frames) and the pending requests (`requests`). Each browser has
+its own bounded outbound queue so a slow client never stalls the link reader.
 
 Run state is only trusted while the node's link is up: on link-up every buffer of that node is
 reset and the sessions browsers watch are re-attached. Watched sessions are also re-attached
@@ -18,15 +20,21 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import WSMsgType, web
 
-from omni.proto import NODE_ID_RE, STORED_ID_RE, RemoteError
+from omni import __version__
+from omni.proto import NODE_ID_RE, STORED_ID_RE, RemoteError, session_key
 
 from .auth import USER_KEY
 from .links import LinkManager, NodeUnavailable
+from .sessions import row_title
+
+if TYPE_CHECKING:
+    from .sessions import SessionIndex
 
 log = logging.getLogger("omni.hub.live")
 
@@ -36,6 +44,7 @@ REASONING_TAIL = 4000
 MAX_TOOLS = 50
 CLIENT_QUEUE = 2000
 NODES_DEBOUNCE_S = 1.0
+REQUESTS_DEBOUNCE_S = 0.2
 REATTACH_S = 20 * 60        # well below the link's 2h idle detach
 ATTACH_TIMEOUT = 30.0
 
@@ -47,6 +56,9 @@ class SessionBuffer:
     tools: dict[str, dict[str, Any]] = field(default_factory=dict)
     requests: dict[str, dict[str, Any]] = field(default_factory=dict)
     last_seq: int = 0
+    meta: dict[str, Any] | None = None
+    queue: list[dict[str, Any]] = field(default_factory=list)
+    locked: dict[str, Any] | None = None
 
     def reset_run(self) -> None:
         """Forget the in-progress turn (its end may have been missed while the link was down)."""
@@ -55,7 +67,7 @@ class SessionBuffer:
         self.tools = {}
 
     def start_turn(self, text: str = "") -> None:
-        self.turn = {"text": text, "reasoning": ""}
+        self.turn = {"text": text, "reasoning": "", "started_at": time.time()}
         self.tools = {}
 
     def snapshot_turn(self) -> dict[str, Any] | None:
@@ -69,6 +81,7 @@ class BrowserClient:
         self.ws = ws
         self.user = user
         self.subs: set[SessionKey] = set()
+        self.deliveries = False      # wants raw `delivery` frames (debug)
         self.queue: asyncio.Queue[str | None] = asyncio.Queue(CLIENT_QUEUE)
         self.writer: asyncio.Task[None] | None = None
         self.dead = False
@@ -96,11 +109,13 @@ class BrowserClient:
 
 
 class Live:
-    def __init__(self, links: LinkManager):
+    def __init__(self, links: LinkManager, index: "SessionIndex"):
         self.links = links
+        self.index = index
         self.clients: set[BrowserClient] = set()
         self.buffers: dict[SessionKey, SessionBuffer] = {}
         self._nodes_timer: asyncio.TimerHandle | None = None
+        self._requests_timer: asyncio.TimerHandle | None = None
         self._reattacher: asyncio.Task[None] | None = None
 
     # --- lifecycle -------------------------------------------------------------------
@@ -150,6 +165,23 @@ class Live:
             if key in c.subs:
                 c.put(msg)
 
+    def publish_delivery(self, d: dict[str, Any]) -> None:
+        msg = {"type": "delivery", "delivery": d}
+        for c in list(self.clients):
+            if c.deliveries:
+                c.put(msg)
+
+    def publish_incoming(self, node: str, sid: str, d: dict[str, Any]) -> None:
+        """A delivery was just submitted to (node, sid): show it in that session's open chats."""
+        from_key = session_key(d["from_node"], d["from_stored"]) if d.get("from_node") and d.get("from_stored") \
+            else None
+        self.publish((node, sid), {
+            "type": "session.incoming", "node": node, "stored_id": sid,
+            "delivery": {"id": d["id"], "kind": d["kind"], "from_addr": d.get("from_addr"), "from_key": from_key,
+                         "from_title": d.get("from_title") or ("사용자" if from_key is None else None),
+                         "message": d.get("message") or "", "expect_reply": bool(d.get("expect_reply")),
+                         "at": d.get("dispatched_at") or time.time()}})
+
     def nodes_changed(self) -> None:
         """Debounced {"type":"nodes"} broadcast."""
         if self._nodes_timer is None:
@@ -159,8 +191,19 @@ class Live:
         self._nodes_timer = None
         self.publish_all({"type": "nodes", "nodes": self.links.nodes_json()})
 
-    def _requests_changed(self) -> None:
-        self.publish_all({"type": "requests", "count": self.request_count()})
+    def _requests_changed(self, node: str | None = None, sid: str | None = None) -> None:
+        if node is not None and sid is not None:
+            self.index.live_changed(node, sid)
+        if self._requests_timer is None:
+            self._requests_timer = asyncio.get_running_loop().call_later(REQUESTS_DEBOUNCE_S, self._flush_requests)
+
+    def _flush_requests(self) -> None:
+        self._requests_timer = None
+        self.publish_all(self.requests_frame())
+
+    def requests_frame(self) -> dict[str, Any]:
+        items = self.requests_items()
+        return {"type": "requests", "count": len(items), "items": items}
 
     # --- queries ---------------------------------------------------------------------
     def buf(self, node: str, sid: str) -> SessionBuffer:
@@ -170,25 +213,36 @@ class Live:
         b = self.buffers.get((node, sid))
         return bool(b and b.running)
 
+    def requests_items(self) -> list[dict[str, Any]]:
+        out = []
+        for (node, sid), b in self.buffers.items():
+            if not self.links.is_online(node) or not b.requests:
+                continue
+            row = self.index.get(node, sid) or {}
+            for r in b.requests.values():
+                out.append({"node": node, "stored_id": sid, "title": row_title(row) if row else sid,
+                            "request_id": r.get("request_id"), "method": r.get("method"), "at": r.get("_at")})
+        out.sort(key=lambda x: x.get("at") or 0)
+        return out
+
     def requests_list(self) -> list[dict[str, Any]]:
+        """GET /api/requests (v2 shape, kept for debugging)."""
         out = []
         for (node, sid), b in sorted(self.buffers.items()):
             if not self.links.is_online(node):
                 continue
             for r in b.requests.values():
-                out.append({"node": node, "stored_id": sid, "request": r})
+                out.append({"node": node, "stored_id": sid, "request": _public_request(r)})
         return out
-
-    def request_count(self) -> int:
-        return sum(len(b.requests) for (node, _), b in self.buffers.items() if self.links.is_online(node))
 
     def snapshot(self, node: str, sid: str) -> dict[str, Any]:
         """Current live state. `seq` is the last event seq folded into it: events with a
         seq <= this are already reflected (0 = unknown, accept everything)."""
         b = self.buf(node, sid)
         return {"type": "session.snapshot", "node": node, "stored_id": sid, "seq": b.last_seq,
-                "running": b.running, "turn": b.snapshot_turn(), "requests": list(b.requests.values()),
-                "online": self.links.is_online(node)}
+                "running": b.running, "turn": b.snapshot_turn(),
+                "requests": [_public_request(r) for r in b.requests.values()],
+                "meta": b.meta, "queue": b.queue, "locked": b.locked, "online": self.links.is_online(node)}
 
     def drop_request(self, node: str, sid: str, request_id: str) -> None:
         """Forget a request (e.g. answered through the hub)."""
@@ -196,7 +250,17 @@ class Live:
         if b and b.requests.pop(request_id, None) is not None:
             self.publish((node, sid), {"type": "session.request_cancel", "node": node, "stored_id": sid,
                                        "request_id": request_id})
-            self._requests_changed()
+            self._requests_changed(node, sid)
+
+    def set_locked(self, node: str, sid: str, surface: str | None, message: str = "") -> None:
+        b = self.buf(node, sid)
+        new = {"surface": surface or "다른 창"} if surface is not None else None
+        if new == b.locked:
+            return
+        b.locked = new
+        if new is not None:
+            self.publish((node, sid), {"type": "session.error", "node": node, "stored_id": sid,
+                                       "code": "session_locked", "message": message, "surface": new["surface"]})
 
     # --- link events -----------------------------------------------------------------
     def on_link_event(self, node: str, f: dict[str, Any]) -> None:
@@ -210,7 +274,10 @@ class Live:
             seq = f.get("seq")
             if isinstance(seq, int):
                 b.last_seq = seq
+            was = b.running
             self._apply_event(b, etype, payload)
+            if b.running != was:
+                self.index.live_changed(node, sid)
             self.publish(key, {"type": "session.event", "node": node, "stored_id": sid, "seq": seq,
                                "event_type": etype, "payload": payload})
         elif kind == "session.state":
@@ -218,22 +285,39 @@ class Live:
             if not b.running:
                 b.turn = None
             msg = {"type": "session.state", "node": node, "stored_id": sid, "running": b.running}
-            for k in ("title", "cwd"):
+            for k in ("title", "cwd", "status", "last_turn_status"):
                 if k in f:
                     msg[k] = f[k]
             self.publish(key, msg)
+            self.index.live_changed(node, sid)
         elif kind == "session.request":
             r = f.get("request")
             if isinstance(r, dict) and r.get("request_id"):
+                r = {**r, "_at": time.time()}
                 b.requests[str(r["request_id"])] = r
-                self.publish(key, {"type": "session.request", "node": node, "stored_id": sid, "request": r})
-                self._requests_changed()
+                self.publish(key, {"type": "session.request", "node": node, "stored_id": sid,
+                                   "request": _public_request(r)})
+                self._requests_changed(node, sid)
         elif kind == "session.request_cancel":
             rid = str(f.get("request_id") or "")
             b.requests.pop(rid, None)
             self.publish(key, {"type": "session.request_cancel", "node": node, "stored_id": sid,
-                               "request_id": rid})
-            self._requests_changed()
+                               "request_id": rid, "reason": f.get("reason")})
+            self._requests_changed(node, sid)
+        elif kind == "session.meta":
+            if isinstance(f.get("meta"), dict):
+                b.meta = f["meta"]
+                self.publish(key, {"type": "session.meta", "node": node, "stored_id": sid, "meta": b.meta})
+        elif kind == "session.queue":
+            items = f.get("items") if isinstance(f.get("items"), list) else []
+            b.queue = [i for i in items if isinstance(i, dict)]
+            msg = {"type": "session.queue", "node": node, "stored_id": sid, "items": b.queue}
+            dropped = f.get("dropped")
+            if isinstance(dropped, list) and dropped:
+                # Queued prompts Hermes dropped and the link could not resubmit: the browser returns
+                # the text to the composer (one-off, not part of the snapshot).
+                msg["dropped"] = [t for t in dropped if isinstance(t, str)]
+            self.publish(key, msg)
         elif kind == "turn.done":
             b.turn = None
             b.tools = {}
@@ -241,7 +325,7 @@ class Live:
             self.publish(key, {"type": "turn.done", "node": node, **msg})
             if b.requests:   # nothing can still be pending once the turn is over
                 b.requests.clear()
-                self._requests_changed()
+                self._requests_changed(node, sid)
 
     def _apply_event(self, b: SessionBuffer, etype: str, p: dict[str, Any]) -> None:
         if etype == "message.start":
@@ -261,12 +345,14 @@ class Live:
             b.turn["reasoning"] = (b.turn["reasoning"] + str(p.get("text") or ""))[-REASONING_TAIL:]
         elif etype == "tool.generating":
             name = str(p.get("name") or "tool")
-            b.tools.setdefault(f"gen:{name}", {"tool_id": None, "name": name, "state": "generating", "preview": None})
+            b.tools.setdefault(f"gen:{name}", {"tool_id": None, "name": name, "state": "generating", "preview": None,
+                                               "args": None, "error": None, "duration_s": None})
         elif etype == "tool.start":
             name = str(p.get("name") or "tool")
             b.tools.pop(f"gen:{name}", None)
             tid = str(p.get("tool_id") or f"anon:{len(b.tools)}")
-            b.tools[tid] = {"tool_id": tid, "name": name, "state": "running", "preview": None}
+            b.tools[tid] = {"tool_id": tid, "name": name, "state": "running", "preview": None,
+                            "args": p.get("args"), "error": None, "duration_s": None, "started_at": time.time()}
         elif etype == "tool.complete":
             tid = str(p.get("tool_id") or "")
             chip = b.tools.get(tid)
@@ -276,6 +362,8 @@ class Live:
             if chip is not None:
                 chip["state"] = "error" if p.get("error") else "done"
                 chip["preview"] = p.get("result_preview") or p.get("error")
+                chip["error"] = p.get("error")
+                chip["duration_s"] = p.get("duration_s")
         elif etype == "message.complete":
             text = p.get("text")
             if isinstance(text, str):
@@ -292,6 +380,7 @@ class Live:
         if moved:
             ob = self.buffers.pop(ok)
             self.buffers.setdefault(nk, ob)
+        self.index.on_session_tip(node, old, new)
         watchers = [c for c in self.clients if ok in c.subs]
         if not moved and not watchers:
             return
@@ -328,6 +417,8 @@ class Live:
         try:
             res = await self.links.call(node, "session.attach", {"stored_id": sid}, timeout=ATTACH_TIMEOUT)
         except RemoteError as e:
+            if e.code == "session_locked":
+                self.set_locked(node, sid, str(e.extra.get("surface") or "다른 창"), e.message)
             return sid, f"{e.code}: {e.message}"
         except NodeUnavailable as e:
             return sid, str(e)
@@ -339,12 +430,19 @@ class Live:
             await self.links.on_session_tip(node, sid, tip)
             sid = tip
         b = self.buf(node, sid)
+        b.locked = None
         # Snapshots are built right after this without yielding, so this is the seq they carry.
         last_seq = res.get("last_seq")
         b.last_seq = last_seq if isinstance(last_seq, int) and last_seq >= 0 else 0
         b.running = bool(res.get("running"))
+        if isinstance(res.get("meta"), dict):
+            b.meta = res["meta"]
+        if isinstance(res.get("queue"), list):
+            b.queue = [i for i in res["queue"] if isinstance(i, dict)]
         reqs = res.get("open_requests") if isinstance(res.get("open_requests"), list) else []
-        new_reqs = {str(r["request_id"]): r for r in reqs if isinstance(r, dict) and r.get("request_id")}
+        now = time.time()
+        new_reqs = {str(r["request_id"]): {**r, "_at": (b.requests.get(str(r["request_id"])) or {}).get("_at", now)}
+                    for r in reqs if isinstance(r, dict) and r.get("request_id")}
         changed = new_reqs.keys() != b.requests.keys()
         b.requests = new_reqs
         if b.running and b.turn is None:
@@ -354,7 +452,7 @@ class Live:
             b.turn = None
             b.tools = {}
         if changed:
-            self._requests_changed()
+            self._requests_changed(node, sid)
         return sid, None
 
     # --- /ws endpoint ----------------------------------------------------------------
@@ -364,9 +462,10 @@ class Live:
         client = BrowserClient(ws, request[USER_KEY])
         client.writer = asyncio.create_task(client.write_loop())
         self.clients.add(client)
-        client.put({"type": "hello", "user": client.user})
+        client.put({"type": "hello", "user": client.user, "hub_version": __version__})
         client.put({"type": "nodes", "nodes": self.links.nodes_json()})
-        client.put({"type": "requests", "count": self.request_count()})
+        client.put(self.index.full_frame())
+        client.put(self.requests_frame())
         try:
             async for msg in ws:
                 if msg.type != WSMsgType.TEXT:
@@ -392,6 +491,14 @@ class Live:
         if op == "ping":
             client.put({"type": "pong"})
             return
+        if op == "resync":
+            client.put({"type": "nodes", "nodes": self.links.nodes_json()})
+            client.put(self.index.full_frame())
+            client.put(self.requests_frame())
+            return
+        if op == "sub_deliveries":
+            client.deliveries = True
+            return
         if op in ("sub", "unsub"):
             node, sid = data.get("node"), data.get("stored_id")
             if not (isinstance(node, str) and NODE_ID_RE.match(node)
@@ -414,12 +521,24 @@ class Live:
         snap = self.snapshot(node, cur)
         if err:
             snap["error"] = err
+            if not err.startswith("session_locked"):
+                client.put({"type": "session.error", "node": node, "stored_id": cur, "code": "attach_failed",
+                            "message": err})
+        elif not self.links.is_online(node):
+            client.put({"type": "session.error", "node": node, "stored_id": cur, "code": "node_offline",
+                        "message": f"{node} is offline"})
         client.put(snap)
 
     async def close_all(self) -> None:
         for c in list(self.clients):
             with contextlib.suppress(Exception):
                 await c.ws.close(code=1001, message=b"hub shutting down")
+
+
+def _public_request(r: dict[str, Any]) -> dict[str, Any]:
+    out = {k: v for k, v in r.items() if k != "_at"}
+    out["at"] = r.get("_at")
+    return out
 
 
 _TASKS: set[asyncio.Task[Any]] = set()

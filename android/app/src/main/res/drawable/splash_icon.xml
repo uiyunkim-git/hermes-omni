@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- API 31+ splash icon. The system scales this to its icon box (up to 288dp, masked to a 192dp
+     circle), so the 24-grid mark is drawn at 1.1x in the middle of a 108 canvas: about 49dp tall,
+     matching launch_bg.xml, which stays behind the WebView after the splash fades. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+  <group android:translateX="40.8" android:translateY="40.8" android:scaleX="1.1" android:scaleY="1.1">
+    <path android:strokeColor="@color/text_primary" android:strokeWidth="1.75"
+        android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:pathData="M7,5 L7,19 M17,5 L17,19 M7,11.75 L17,11.75" />
+  </group>
+</vector>

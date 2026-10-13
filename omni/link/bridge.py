@@ -5,9 +5,10 @@ Every request must carry ``X-Omni-Token: $OMNI_LINK_TOKEN``.
   GET  /bridge/directory?session_id=
   POST /bridge/send   {session_id, to, message, wait, expect_reply, timeout_s}
   GET  /bridge/inbox?session_id=&limit=
-The plugin's ``session_id`` is the stored session id (current tip). The link resolves the
-sender address from the session's cwd and the hop chain from the delivery the session is
-currently answering, mints the delivery id and calls hub ``agent.send``.
+The plugin's ``session_id`` is the stored session id (current tip). The sender address is
+``node#sid`` (plus the session title for the message header); the hop chain and the conversation
+come from the delivery the session is currently answering (``cause_id``). The link mints the
+delivery id and calls hub ``agent.send``; the hub resolves ``to`` (address, folder or title).
 """
 
 from __future__ import annotations
@@ -21,8 +22,8 @@ from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from omni.proto import (HEADER_LINK_TOKEN, MESSAGE_MAX_CHARS, STORED_ID_RE, WAIT_DEFAULT_S, WAIT_MAX_S, RemoteError,
-                        format_address, new_delivery_id, parse_address)
+from omni.proto import (HEADER_LINK_TOKEN, MESSAGE_MAX_CHARS, STORED_ID_RE, TO_MAX, WAIT_DEFAULT_S, WAIT_MAX_S,
+                        RemoteError, new_delivery_id)
 from omni.link.hubconn import HubUnavailable
 
 if TYPE_CHECKING:
@@ -98,16 +99,17 @@ class Bridge:
     async def _hub(self, method: str, params: dict[str, Any], timeout: float = 30) -> dict[str, Any]:
         return await self.agent.hub.request(method, params, timeout=timeout)
 
-    async def _chain_for(self, stored_id: str) -> list[str]:
-        """Hop chain: if the session is answering a delivery, that delivery's chain + its sender."""
+    async def _chain_for(self, stored_id: str) -> tuple[str | None, list[str]]:
+        """(cause delivery id, hop chain): if the session is answering a delivery, that delivery's
+        chain + its sender."""
         did = await self.agent.sessions.current_delivery(stored_id)
         if not did:
-            return []
+            return None, []
         try:
             res = await self._hub("delivery.get", {"delivery_id": did}, timeout=PREP_TIMEOUT_S)
         except (RemoteError, HubUnavailable) as e:
             log.warning("delivery.get %s failed (%s); sending with empty chain", did, e)
-            return []
+            return did, []
         d = res.get("delivery") or {}
         chain = d.get("chain")
         if chain is None and isinstance(d.get("chain_json"), str):
@@ -119,7 +121,7 @@ class Bridge:
         sender = d.get("from_addr") or d.get("from_address")
         if isinstance(sender, str) and sender:
             chain.append(sender)
-        return chain
+        return did, chain
 
     # --- routes --------------------------------------------------------------------------
     async def health(self, request: web.Request) -> web.Response:
@@ -127,8 +129,15 @@ class Bridge:
                       "hermes_connected": self.agent.hermes.connected.is_set()})
 
     async def directory(self, request: web.Request) -> web.Response:
+        params: dict[str, Any] = {}
+        query = (request.query.get("query") or "").strip()
+        if query:
+            params["query"] = query[:200]
+        sid = self._session_id(request.query.get("session_id"))
+        if sid:
+            params["stored_id"] = sid
         try:
-            return _json(await self._hub("agent.directory", {}))
+            return _json(await self._hub("agent.directory", params))
         except RemoteError as e:
             return _json({"error": f"{e.code}: {e.message}"}, 502)
         except HubUnavailable as e:
@@ -163,10 +172,9 @@ class Bridge:
         if sid is None:
             return _json({"status": "rejected", "reason": "session_id required"}, 400)
         to, message = body.get("to"), body.get("message")
-        try:
-            parse_address(to)
-        except ValueError as e:
-            return _json({"status": "rejected", "reason": f"bad address: {e}"}, 400)
+        if not isinstance(to, str) or not to.strip() or len(to.strip()) > TO_MAX:
+            return _json({"status": "rejected", "reason": "bad_target",
+                          "message": f"to must be 1-{TO_MAX} characters"}, 400)
         if not isinstance(message, str) or not message.strip():
             return _json({"status": "rejected", "reason": "message required"}, 400)
         if len(message) > MESSAGE_MAX_CHARS:
@@ -181,8 +189,10 @@ class Bridge:
         deadline = arrived + (timeout_s + WAIT_SLACK_S if wait else ASYNC_BUDGET_S)
 
         delivery_id = new_delivery_id()
-        from_address, chain = await asyncio.gather(self._from_address(sid), self._bounded_chain(sid))
+        from_address = self.agent.address_for_session(sid)
+        cause_id, chain = await self._bounded_chain(sid)
         params = {"delivery_id": delivery_id, "from_stored_id": sid, "from_address": from_address,
+                  "from_title": self.agent.title_for_session(sid), "cause_id": cause_id,
                   "chain": chain, "to": to.strip(), "message": message, "expect_reply": expect_reply,
                   "wait": wait, "timeout_s": timeout_s}
         log.info("agent.send %s %s -> %s (wait=%s, chain=%d)", delivery_id, from_address, params["to"], wait,
@@ -195,19 +205,12 @@ class Bridge:
             log.warning("agent.send %s: %s; recovering", delivery_id, e)
         return _json(await self._recover(params, deadline))
 
-    async def _from_address(self, sid: str) -> str:
-        try:
-            return await asyncio.wait_for(self.agent.address_for_session(sid), PREP_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            log.warning("address lookup for %s timed out; using the session address", sid)
-            return format_address(self.cfg.node_id, None, sid)
-
-    async def _bounded_chain(self, sid: str) -> list[str]:
+    async def _bounded_chain(self, sid: str) -> tuple[str | None, list[str]]:
         try:
             return await asyncio.wait_for(self._chain_for(sid), PREP_TIMEOUT_S)
         except asyncio.TimeoutError:
             log.warning("hop chain lookup for %s timed out; sending with empty chain", sid)
-            return []
+            return None, []
 
     async def _recover(self, params: dict[str, Any], deadline: float) -> dict[str, Any]:
         """The hub link dropped (or went silent) mid-send; answer by ``deadline`` at the latest.

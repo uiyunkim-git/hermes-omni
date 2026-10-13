@@ -1,31 +1,46 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources xmlns:tools="http://schemas.android.com/tools">
-  <!-- Base differs per night mode (values-night/themes.xml); WebView derives
+  <!-- Theme chain: Base (light/night parent) -> Platform (launch window, differs on API 31+) -> AppTheme.
+       The web app bar is the only bar, so there is no native action bar. WebView derives
        prefers-color-scheme from the resulting android:isLightTheme. -->
-  <style name="Base.AppTheme" parent="android:Theme.Material.Light" />
+  <style name="Base.AppTheme" parent="android:Theme.Material.Light.NoActionBar" />
 
-  <style name="AppTheme" parent="Base.AppTheme">
-    <item name="android:colorPrimary">@color/bar_bg</item>
-    <item name="android:colorPrimaryDark">@color/bar_bg</item>
+  <!-- Launch window: the mark on the surface color, visible behind the transparent WebView until
+       the hub page has loaded (MainActivity then swaps in the plain page color). API 31+ adds the
+       system splash in values-v31/themes.xml. -->
+  <style name="Platform.AppTheme" parent="Base.AppTheme">
+    <item name="android:windowBackground">@drawable/launch_bg</item>
+  </style>
+
+  <style name="AppTheme" parent="Platform.AppTheme">
+    <item name="android:colorPrimary">@color/surface</item>
+    <item name="android:colorPrimaryDark">@color/surface</item>
     <item name="android:colorAccent">@color/accent</item>
-    <item name="android:windowBackground">@color/surface</item>
-    <item name="android:statusBarColor">@color/bar_bg</item>
-    <item name="android:navigationBarColor">@color/bar_bg</item>
+    <item name="android:colorControlActivated">@color/accent</item>
+    <item name="android:textColorPrimary">@color/text_primary</item>
+    <item name="android:textColorSecondary">@color/text_secondary</item>
+    <item name="android:statusBarColor">@color/surface</item>
+    <item name="android:navigationBarColor">@color/surface</item>
     <item name="android:windowLightStatusBar">@bool/light_bars</item>
     <item name="android:windowLightNavigationBar" tools:targetApi="27">@bool/light_bars</item>
-    <item name="android:actionBarStyle">@style/AppTheme.ActionBar</item>
+    <item name="android:alertDialogTheme">@style/AppTheme.Dialog</item>
     <!-- Android 15 enforces edge-to-edge at targetSdk 35; keep classic insets for the WebView. -->
     <item name="android:windowOptOutEdgeToEdgeEnforcement" tools:targetApi="35">true</item>
   </style>
 
-  <style name="AppTheme.ActionBar" parent="android:Widget.Material.ActionBar.Solid">
-    <item name="android:background">@color/bar_bg</item>
-    <item name="android:elevation">0dp</item>
-    <item name="android:titleTextStyle">@style/AppTheme.ActionBar.Title</item>
+  <!-- Native dialogs (hub URL, update, shell menu) in the same palette as the web UI. -->
+  <style name="Base.AppTheme.Dialog" parent="android:Theme.Material.Light.Dialog.Alert" />
+  <style name="AppTheme.Dialog" parent="Base.AppTheme.Dialog">
+    <item name="android:colorAccent">@color/accent</item>
+    <item name="android:colorControlActivated">@color/accent</item>
+    <item name="android:textColorPrimary">@color/text_primary</item>
+    <item name="android:textColorSecondary">@color/text_secondary</item>
+    <item name="android:windowBackground">@drawable/dialog_bg</item>
+    <item name="android:buttonBarButtonStyle">@style/AppTheme.DialogButton</item>
   </style>
-
-  <style name="AppTheme.ActionBar.Title" parent="android:TextAppearance.Material.Widget.ActionBar.Title">
-    <item name="android:textColor">@color/text_primary</item>
-    <item name="android:textSize">17sp</item>
+  <style name="AppTheme.DialogButton" parent="android:Widget.Material.Button.Borderless.Colored">
+    <item name="android:textAllCaps">false</item>
+    <item name="android:textColor">@color/accent</item>
+    <item name="android:textSize">15sp</item>
   </style>
 </resources>

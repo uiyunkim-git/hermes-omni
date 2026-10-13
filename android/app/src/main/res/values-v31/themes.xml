@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <!-- API 31+: the system splash screen (surface color + the mark, no branding image).
+       MainActivity keeps it up until the hub page has loaded or 2.5 s have passed; the window
+       background behind the transparent WebView shows the same mark until the page is up. -->
+  <style name="Platform.AppTheme" parent="Base.AppTheme">
+    <item name="android:windowBackground">@drawable/launch_bg</item>
+    <item name="android:windowSplashScreenBackground">@color/surface</item>
+    <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_icon</item>
+  </style>
+</resources>

@@ -1,44 +1,53 @@
-// #/login — hub admin sign-in (POST /api/login sets the omni_session cookie).
+// Login (spec §3.1): wordmark, tagline, 아이디/비밀번호, one primary button, inline errors.
 
 import { api } from '../api.js';
-import { h } from '../util.js';
+import { h, nextId, fill } from '../util.js';
+import { spinner } from '../ui/controls.js';
 
-export default function loginView(main, ctx) {
-  const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
-  const user = h('input', { id: 'login-user', class: 'input', name: 'username', autocomplete: 'username', autocapitalize: 'off', spellcheck: 'false', required: true });
-  const pass = h('input', { id: 'login-pass', class: 'input', name: 'password', type: 'password', autocomplete: 'current-password', required: true });
-  const submit = h('button', { type: 'submit', class: 'btn btn-primary btn-block' }, 'Sign in');
+/** @param {HTMLElement} root @param {{onLogin:(user:string)=>void}} o */
+export function mountLogin(root, o) {
+  const uid = nextId('user');
+  const pid = nextId('pass');
+  const user = h('input', { id: uid, class: 'input lg', autocomplete: 'username', autocapitalize: 'off', spellcheck: 'false', required: true, enterkeyhint: 'next' });
+  const pass = h('input', { id: pid, class: 'input lg', type: 'password', autocomplete: 'current-password', required: true, enterkeyhint: 'go' });
+  const submit = h('button', { type: 'submit', class: 'btn btn-primary btn-lg btn-block' }, h('span', { text: '로그인' }));
+  const err = h('p', { class: 'field-error', role: 'alert', hidden: true });
+  let busy = false;
 
-  const form = h('form', { class: 'card login-card', onsubmit: onSubmit, 'aria-labelledby': 'login-h' },
-    h('h1', { id: 'login-h', class: 'h1', text: 'Sign in' }),
-    h('p', { class: 'muted', text: 'Use the Hermes dashboard credentials of the hub machine.' }),
-    h('label', { class: 'field' }, h('span', { class: 'field-label', text: 'Username' }), user),
-    h('label', { class: 'field' }, h('span', { class: 'field-label', text: 'Password' }), pass),
-    err,
-    submit);
+  const form = h('form', {
+    class: 'login-form',
+    onsubmit: async (e) => {
+      e.preventDefault();
+      if (busy) return;
+      busy = true;
+      err.hidden = true;
+      submit.disabled = true;
+      fill(submit, spinner(16, 'on-accent'));
+      try {
+        const res = await api.login(user.value.trim(), pass.value);
+        o.onLogin(res.user || user.value.trim());
+      } catch (ex) {
+        err.textContent = ex.status === 401 ? '아이디 또는 비밀번호가 맞지 않아요'
+          : ex.status === 429 ? '잠시 후 다시 시도하세요'
+            : ex.status === 0 ? '허브에 연결할 수 없어요' : (ex.message || '로그인하지 못했어요');
+        err.hidden = false;
+        busy = false;
+        submit.disabled = false;
+        fill(submit, h('span', { text: '로그인' }));
+        pass.select();
+      }
+    },
+  },
+  h('div', { class: 'field' }, h('label', { class: 'field-label', for: uid, text: '아이디' }), user),
+  h('div', { class: 'field' }, h('label', { class: 'field-label', for: pid, text: '비밀번호' }), pass),
+  submit, err);
 
-  main.append(h('div', { class: 'page narrow' }, form));
-  setTimeout(() => user.focus(), 0);
-
-  async function onSubmit(e) {
-    e.preventDefault();
-    err.hidden = true;
-    submit.disabled = true;
-    submit.textContent = 'Signing in…';
-    try {
-      const res = await api.login(user.value.trim(), pass.value);
-      pass.value = '';
-      ctx.onLogin(res.user || user.value.trim());
-      ctx.navigate(ctx.query.get('next') || '#/', { replace: true });
-    } catch (ex) {
-      err.textContent = ex.status === 401 ? 'Wrong username or password.'
-        : ex.status === 429 ? 'Too many attempts — wait a minute and try again.'
-          : ex.message;
-      err.hidden = false;
-      submit.disabled = false;
-      submit.textContent = 'Sign in';
-      pass.select();
-    }
-  }
-  return null;
+  fill(root, h('main', { class: 'login' },
+    h('div', { class: 'login-col' },
+      h('div', { class: 'login-brand' },
+        h('h1', { class: 'wordmark', text: 'Hermes' }),
+        h('p', { class: 'tagline', text: '모든 머신의 세션을 한곳에서' })),
+      form)));
+  setTimeout(() => user.focus(), 50);
+  return { destroy() {} };
 }

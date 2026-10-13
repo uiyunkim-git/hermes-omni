@@ -176,6 +176,28 @@ class HermesClient:
                 raise HermesUnavailable(f"{method} {path}: {e!r}") from e
         raise HermesError(401, f"{method} {path}: unauthorized")
 
+    async def rest_raw(self, method: str, path: str, *, params: dict[str, Any] | None = None,
+                       json_body: Any = None, timeout: float = 30) -> tuple[int, Any]:
+        """Bearer-authenticated REST call that does not raise on HTTP errors: (status, body).
+        The body is parsed JSON when possible, else the text (capped)."""
+        assert self.http is not None
+        for attempt in (0, 1):
+            token = await self._auth(force=attempt == 1)
+            try:
+                async with self.http.request(method, f"{self.base}{path}", params=params, json=json_body,
+                                             headers={"Authorization": f"Bearer {token}"},
+                                             timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                    if r.status == 401 and attempt == 0:
+                        continue
+                    text = await r.text()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                raise HermesUnavailable(f"{method} {path}: {e!r}") from e
+            try:
+                return r.status, (json.loads(text) if text else None)
+            except ValueError:
+                return r.status, text[:20000]
+        raise HermesError(401, f"{method} {path}: unauthorized")
+
     async def public_get(self, path: str) -> Any:
         assert self.http is not None
         try:

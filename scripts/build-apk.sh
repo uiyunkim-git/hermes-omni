@@ -8,7 +8,8 @@
 # - versionCode = yymmddHH (bumped past the published one), versionName = 0.1.<versionCode>.
 # - Release key: generated once at omni-state/android/release.jks with a random password in
 #   omni-state/android/keystore.pass (mode 600). Keep both: a new key forces users to reinstall.
-# - Checks: apksigner verify, zipalign -c, aapt2 badging (package/versionCode/label), signer
+# - Checks: apksigner verify, zipalign -c, aapt2 badging (package/versionCode/label), manifest
+#   invariants (no CAMERA permission, private capture provider), signer
 #   continuity against the previously published meta.json.
 #
 # Usage: scripts/build-apk.sh [--hub-url URL] [--allow-signer-change]
@@ -25,7 +26,7 @@ GRADLE_VOLUME="${OMNI_GRADLE_VOLUME:-hermes-omni-gradle}"
 GRADLE_VERSION=8.10.2
 GRADLE_SHA256=31c55713e40233a8303827ceb42ca48a47267a0ad4bab9177123121e71524c26
 PACKAGE=net.hermesomni.app
-APP_LABEL="Hermes Omni"
+APP_LABEL="Hermes"
 KS_ALIAS=hermes-omni
 CONTAINER="omni-build-android-$$"
 
@@ -168,6 +169,7 @@ BT="$ANDROID_HOME/build-tools/35.0.0"
 "$BT/zipalign" -c 4 "$APK"
 "$BT/apksigner" verify --verbose --print-certs "$APK" > /out/apksigner.txt
 "$BT/aapt2" dump badging "$APK" > /out/badging.txt
+"$BT/aapt2" dump xmltree --file AndroidManifest.xml "$APK" > /out/manifest.txt
 unzip -l "$APK" > /out/contents.txt
 cp "$APK" /out/hermes-omni.apk
 chown -R "$HOST_UID:$HOST_GID" /out
@@ -197,6 +199,11 @@ grep -q '^Verifies$' "$STAGE/apksigner.txt" || die "apksigner verify failed: $(c
 grep -q "^package: name='$PACKAGE' versionCode='$VERSION_CODE' versionName='$VERSION_NAME'" "$STAGE/badging.txt" \
   || die "badging mismatch: $(head -n 1 "$STAGE/badging.txt")"
 grep -q "^application-label:'$APP_LABEL'" "$STAGE/badging.txt" || die "badging: app label is not '$APP_LABEL'"
+# Manifest invariants (aapt2 xmltree): no CAMERA permission (it would make the file chooser's
+# ACTION_IMAGE_CAPTURE fail until granted) and the capture provider stays private.
+grep -q '"android.permission.CAMERA"' "$STAGE/manifest.txt" && die "manifest: CAMERA permission must not be declared"
+awk '/E: provider/{p=1} p&&/:exported\(/{print; exit}' "$STAGE/manifest.txt" | grep -q '=false$' \
+  || die "manifest: CaptureProvider must be android:exported=false"
 SIGNER="$(sed -n 's/^Signer #1 certificate SHA-256 digest: *//p' "$STAGE/apksigner.txt" | head -n 1)"
 [[ "$SIGNER" =~ ^[0-9a-f]{64}$ ]] || die "could not read signer certificate digest"
 if [ -n "$PREV_SIGNER" ] && [ "$PREV_SIGNER" != "$SIGNER" ]; then

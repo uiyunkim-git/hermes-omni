@@ -67,8 +67,49 @@ PY
         *)  echo "[env-config] WARN: could not read plugins from $cfg; $1 not enabled" >&2 ;;
     esac
 }
+
+# hermes-omni: Hermes Tool Search hides every plugin tool behind its tool_call bridge, and weaker
+# models garble that nested call (`calls` sent as a broken JSON string), so "work with that session"
+# failed before hub_send ever ran. With Tool Search off, hub_send/hub_directory/hub_inbox are ordinary
+# direct tools (a few extra schemas; cheap at these context sizes). Only an unset or "auto" value is
+# changed: an explicit on/off in config.yaml is the operator's choice and stays.
+tool_search_off() {
+    cfg="${HERMES_HOME:-/opt/data}/config.yaml"
+    # Exit codes: 0 = set it off, 10 = already off, 11 = explicitly on.
+    /opt/hermes/.venv/bin/python - "$cfg" <<'PY'
+import os, sys
+import yaml
+path = sys.argv[1]
+cfg = {}
+if os.path.exists(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as e:
+        sys.exit(f"{path}: {' '.join(str(e).split())}")
+ts = ((cfg.get("tools") or {}) if isinstance(cfg, dict) else {}).get("tool_search")
+value = ts.get("enabled", "auto") if isinstance(ts, dict) else ("off" if ts is False else "auto")
+value = {True: "on", False: "off"}.get(value, str(value).strip().lower())
+if value in ("off", "false", "no", "0"):
+    sys.exit(10)
+if value in ("on", "true", "yes", "1"):
+    sys.exit(11)
+PY
+    case $? in
+        0)  if out=$(hermes config set tools.tool_search.enabled off 2>&1); then
+                echo "[env-config] tools.tool_search.enabled → off (hub tools stay direct)"
+            else
+                echo "[env-config] WARN: could not turn Tool Search off: $out" >&2
+            fi ;;
+        10) echo "[env-config] Tool Search already off" ;;
+        11) echo "[env-config] WARN: tools.tool_search.enabled is on; hub tools stay behind tool_call" >&2 ;;
+        *)  echo "[env-config] WARN: could not read tools.tool_search from $cfg; left unchanged" >&2 ;;
+    esac
+}
+
 if [ -n "${OMNI_LINK_TOKEN:-}" ]; then
     enable_plugin hub-bridge
+    tool_search_off
 fi
 
 case "${HERMES_APPLY_ENV_CONFIG:-1}" in
