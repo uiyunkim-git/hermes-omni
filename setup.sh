@@ -20,6 +20,8 @@ die()  { printf '\033[1;31m[hermes] 오류:\033[0m %s\n' "$*" >&2; exit 1; }
 PINNED_IMAGE="nousresearch/hermes-agent@sha256:d4da4a40cd7a28aba983775d9fd31d94cbf153eeb0cb9e844d6d0f612b7c24db"
 HUB_PORT_INTERNAL=8800
 LINK_PORT=8810
+TS_SOCKS_PORT=1055       # compose.tailscale.yml 의 TS_SOCKS5_SERVER
+TS_HTTP_PROXY_PORT=1056  # compose.tailscale.yml 의 TS_OUTBOUND_HTTP_PROXY_LISTEN
 JOIN_ENV_KEYS=(LLM_BASE_URL LLM_MODEL LLM_API_KEY LLM_API_MODE LLM_CONTEXT_LENGTH
                HERMES_DASHBOARD_BASIC_AUTH_USERNAME HERMES_DASHBOARD_BASIC_AUTH_PASSWORD TS_AUTHKEY)
 
@@ -193,6 +195,23 @@ done
 tailscale="$(get_kv HERMES_TAILSCALE)"; tailscale="${tailscale:-on}"
 [[ "$tailscale" == on || "$tailscale" == off ]] || die "HERMES_TAILSCALE 는 on|off 중 하나: $tailscale"
 
+# --- tailnet 의 LLM 엔드포인트 -------------------------------------------------------------
+# 사이드카가 userspace 모드라 hermes 컨테이너에는 tailnet 경로가 없다. LLM_BASE_URL 이 tailnet
+# 주소(100.64.0.0/10 또는 *.ts.net)면 사이드카의 아웃바운드 HTTP 프록시를 거치게 한다.
+llm_host="$(get_kv LLM_BASE_URL)"; llm_host="${llm_host#*://}"; llm_host="${llm_host%%/*}"
+llm_host="${llm_host##*@}"; llm_host="${llm_host%%:*}"
+llm_tailnet=0
+if [[ "$llm_host" == *.ts.net ]]; then
+  llm_tailnet=1
+elif [[ "$llm_host" =~ ^100\.([0-9]{1,3})\.[0-9]{1,3}\.[0-9]{1,3}$ ]] \
+     && ((BASH_REMATCH[1] >= 64 && BASH_REMATCH[1] <= 127)); then
+  llm_tailnet=1
+fi
+if ((llm_tailnet)) && [[ "$tailscale" == off ]]; then
+  warn "LLM_BASE_URL 이 tailnet 주소($llm_host)인데 Tailscale 이 꺼져 있어 LLM 에 연결하지 못합니다 (.env 의 HERMES_TAILSCALE)."
+  llm_tailnet=0
+fi
+
 # --- hermes-omni 역할 -------------------------------------------------------------------
 # hub | node. HERMES_ROLE 과 HUB_URL 이 둘 다 비어 있으면(예전 .env) hub 없이 단독 실행 — 기존 동작 그대로.
 role="$(get_kv HERMES_ROLE)"
@@ -334,7 +353,7 @@ write_link_env() {
   if [[ "$role" == hub ]]; then hub="http://hub:$HUB_PORT_INTERNAL"
   else
     hub="$hub_url"
-    if [[ "$tailscale" == on ]]; then socks="socks5://tailscale:1055"; fi
+    if [[ "$tailscale" == on ]]; then socks="socks5://tailscale:$TS_SOCKS_PORT"; fi
   fi
   body="$(env_lines \
       "OMNI_NODE_ID=$node_id" "OMNI_ROLE=$role" "OMNI_HUB_URL=$hub" "OMNI_JOIN_TOKEN=$join_token" \
@@ -401,6 +420,17 @@ gen_override() {
   echo "    environment:"
   echo "      - \"HERMES_WORKSPACE=$ws\""
   if [[ -n "$uid" ]]; then echo "      - HERMES_UID=$uid"; echo "      - HERMES_GID=$gid"; fi
+  if ((llm_tailnet)); then
+    # tailnet 의 LLM 으로 나가는 길. compose 네트워크 안(hermes/link/hub/tailscale)과 로컬은 제외해야
+    # 대시보드·docker.sock·link HTTP 가 프록시로 새지 않는다. 대소문자 둘 다 — 라이브러리마다 보는 쪽이 다르다.
+    local np="localhost,127.0.0.1,::1,hermes,link,hub,tailscale,.local,.internal"
+    echo "      - HTTP_PROXY=http://tailscale:$TS_HTTP_PROXY_PORT"
+    echo "      - http_proxy=http://tailscale:$TS_HTTP_PROXY_PORT"
+    echo "      - HTTPS_PROXY=http://tailscale:$TS_HTTP_PROXY_PORT"
+    echo "      - https_proxy=http://tailscale:$TS_HTTP_PROXY_PORT"
+    echo "      - NO_PROXY=$np"
+    echo "      - no_proxy=$np"
+  fi
   if ((omni)); then
     echo "      - OMNI_LINK_URL=http://link:$LINK_PORT"
     echo "      - OMNI_LINK_TOKEN=$link_token"
@@ -440,6 +470,7 @@ write_file docker-compose.override.yml 600 "$(gen_override)"
 
 if ((use_gpu)); then log "GPU: 모든 nvidia GPU 패스스루"; else log "GPU: 사용 안 함"; fi
 if [[ "$tailscale" == on ]]; then log "Tailscale: 사이드카 노드 $ts_name"; else log "Tailscale: 사용 안 함"; fi
+if ((llm_tailnet)); then log "LLM: $llm_host — Tailscale 사이드카의 HTTP 프록시 경유"; fi
 log "작업 폴더: $ws"
 if ((${#roots[@]} > 1)); then log "프로젝트 루트: ${roots[*]:1}"; fi
 case "$role" in
