@@ -29,3 +29,24 @@ services:
     volumes:
       - ./tailscale/state:/var/lib/tailscale
       - ./tailscale/config:/config:ro
+
+  # tailnet 의 HTTP 엔드포인트를 compose 네트워크의 평범한 주소로 — hermes 는 http://llm-tailnet:18000/v1
+  # 로 그냥 붙는다. 게이트웨이가 s6 때문에 HTTP_PROXY 를 못 받기 때문이다 (docker/tailnet-forward.py 참고).
+  # setup.sh 가 LLM_BASE_URL 이 http:// tailnet 주소일 때만 override 에서 extends 로 붙이고
+  # FWD_TARGET 을 채운다. 별도 이미지 없이 Hermes 이미지의 Python 으로 돈다.
+  llm-tailnet:
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent@sha256:d4da4a40cd7a28aba983775d9fd31d94cbf153eeb0cb9e844d6d0f612b7c24db}
+    container_name: ${HERMES_CONTAINER_NAME:-hermes}-llm-tailnet
+    restart: unless-stopped
+    init: true
+    entrypoint: ["/opt/hermes/.venv/bin/python", "/app/tailnet-forward.py"]
+    command: []
+    environment:
+      - PYTHONUNBUFFERED=1
+      - FWD_LISTEN=18000
+      - FWD_PROXY=tailscale:1056
+    volumes:
+      - ./docker/tailnet-forward.py:/app/tailnet-forward.py:ro
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

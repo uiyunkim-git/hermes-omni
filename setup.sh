@@ -198,8 +198,15 @@ tailscale="$(get_kv HERMES_TAILSCALE)"; tailscale="${tailscale:-on}"
 # --- tailnet 의 LLM 엔드포인트 -------------------------------------------------------------
 # 사이드카가 userspace 모드라 hermes 컨테이너에는 tailnet 경로가 없다. LLM_BASE_URL 이 tailnet
 # 주소(100.64.0.0/10 또는 *.ts.net)면 사이드카의 아웃바운드 HTTP 프록시를 거치게 한다.
-llm_host="$(get_kv LLM_BASE_URL)"; llm_host="${llm_host#*://}"; llm_host="${llm_host%%/*}"
-llm_host="${llm_host##*@}"; llm_host="${llm_host%%:*}"
+llm_url="$(get_kv LLM_BASE_URL)"
+llm_scheme="${llm_url%%://*}"
+llm_rest="${llm_url#*://}"
+llm_authority="${llm_rest%%/*}"; llm_authority="${llm_authority##*@}"
+llm_path="/${llm_rest#*/}"; [[ "$llm_rest" == */* ]] || llm_path=""
+llm_host="${llm_authority%%:*}"
+llm_port="${llm_authority##*:}"
+[[ "$llm_port" != "$llm_authority" && "$llm_port" =~ ^[0-9]{1,5}$ ]] || llm_port=""
+[[ -n "$llm_port" ]] || { [[ "$llm_scheme" == https ]] && llm_port=443 || llm_port=80; }
 llm_tailnet=0
 if [[ "$llm_host" == *.ts.net ]]; then
   llm_tailnet=1
@@ -210,6 +217,17 @@ fi
 if ((llm_tailnet)) && [[ "$tailscale" == off ]]; then
   warn "LLM_BASE_URL 이 tailnet 주소($llm_host)인데 Tailscale 이 꺼져 있어 LLM 에 연결하지 못합니다 (.env 의 HERMES_TAILSCALE)."
   llm_tailnet=0
+fi
+# 게이트웨이는 s6 run 스크립트가 with-contenv 를 쓰지 않아 프로세스 환경이 PATH 뿐이다 — HTTP_PROXY 가
+# 닿지 않는다. 그래서 포워더(llm-tailnet)를 띄워 평범한 내부 주소로 바꿔 준다. http 전용: https 는
+# 클라이언트가 내부 호스트 이름의 인증서를 기대하므로 TLS 가 깨진다.
+llm_fwd=0
+if ((llm_tailnet)); then
+  if [[ "$llm_scheme" == http ]]; then
+    llm_fwd=1
+  else
+    warn "LLM_BASE_URL 이 https 인 tailnet 주소라 포워더를 쓸 수 없습니다. 에이전트가 연결하지 못할 수 있습니다 ($llm_host)."
+  fi
 fi
 
 # --- hermes-omni 역할 -------------------------------------------------------------------
@@ -234,7 +252,10 @@ case "$role" in
       || die "HUB_URL 형식이 올바르지 않습니다 (예: http://hermes-hub.<tailnet>.ts.net): $hub_url"
     join_token="$(get_kv HUB_JOIN_TOKEN)"
     [[ -n "$join_token" ]] || die "HERMES_ROLE=node 에는 HUB_JOIN_TOKEN 이 필요합니다 (hub UI → 머신 추가)."
-    [[ "$join_token" =~ ^[A-Za-z0-9._~-]{16,256}$ ]] || die "HUB_JOIN_TOKEN 형식이 올바르지 않습니다 (다시 복사하세요)."
+    # 상한을 정규식에 두지 않는다: musl(Alpine)의 regcomp 는 반복 상한이 255 를 넘으면 패턴 자체를
+    # 거부해 멀쩡한 토큰도 떨어뜨린다. 길이는 따로 센다.
+    [[ "$join_token" =~ ^[A-Za-z0-9._~-]+$ && ${#join_token} -ge 16 && ${#join_token} -le 256 ]] \
+      || die "HUB_JOIN_TOKEN 형식이 올바르지 않습니다 (다시 복사하세요)."
     if [[ "$tailscale" == off && "$hub_url" == *.ts.net* ]]; then
       warn "Tailscale 이 꺼져 있어 tailnet 주소($hub_url)의 hub 에 접속하지 못할 수 있습니다."
     fi
@@ -420,10 +441,15 @@ gen_override() {
   echo "    environment:"
   echo "      - \"HERMES_WORKSPACE=$ws\""
   if [[ -n "$uid" ]]; then echo "      - HERMES_UID=$uid"; echo "      - HERMES_GID=$gid"; fi
+  if ((llm_fwd)); then
+    # 게이트웨이가 쓰는 주소를 포워더로 돌린다 (environment 가 env_file 의 .env 보다 우선).
+    # .env 자체는 진짜 tailnet 주소를 유지해야 hub 의 Join 한 줄 명령이 다른 머신에서도 맞는다.
+    echo "      - LLM_BASE_URL=http://llm-tailnet:18000$llm_path"
+  fi
   if ((llm_tailnet)); then
-    # tailnet 의 LLM 으로 나가는 길. compose 네트워크 안(hermes/link/hub/tailscale)과 로컬은 제외해야
-    # 대시보드·docker.sock·link HTTP 가 프록시로 새지 않는다. 대소문자 둘 다 — 라이브러리마다 보는 쪽이 다르다.
-    local np="localhost,127.0.0.1,::1,hermes,link,hub,tailscale,.local,.internal"
+    # 에이전트가 셸에서 curl 같은 걸 쓸 때를 위한 프록시 (게이트웨이 자신은 이 변수를 못 받는다).
+    # compose 네트워크 안과 로컬은 제외 — 대시보드·docker.sock·link HTTP 가 프록시로 새지 않도록.
+    local np="localhost,127.0.0.1,::1,hermes,link,hub,tailscale,llm-tailnet,.local,.internal"
     echo "      - HTTP_PROXY=http://tailscale:$TS_HTTP_PROXY_PORT"
     echo "      - http_proxy=http://tailscale:$TS_HTTP_PROXY_PORT"
     echo "      - HTTPS_PROXY=http://tailscale:$TS_HTTP_PROXY_PORT"
@@ -446,6 +472,12 @@ gen_override() {
     echo "    hostname: $ts_name"
     echo "    environment:"
     echo "      - TS_HOSTNAME=$ts_name"
+  fi
+  if ((llm_fwd)); then
+    echo "  llm-tailnet:"
+    echo "    extends: { file: compose.tailscale.yml, service: llm-tailnet }"
+    echo "    environment:"
+    echo "      - FWD_TARGET=$llm_host:$llm_port"
   fi
   if ((omni)); then
     echo "  link:"
@@ -470,7 +502,8 @@ write_file docker-compose.override.yml 600 "$(gen_override)"
 
 if ((use_gpu)); then log "GPU: 모든 nvidia GPU 패스스루"; else log "GPU: 사용 안 함"; fi
 if [[ "$tailscale" == on ]]; then log "Tailscale: 사이드카 노드 $ts_name"; else log "Tailscale: 사용 안 함"; fi
-if ((llm_tailnet)); then log "LLM: $llm_host — Tailscale 사이드카의 HTTP 프록시 경유"; fi
+if ((llm_fwd)); then log "LLM: $llm_host:$llm_port (tailnet) — llm-tailnet 포워더 경유"
+elif ((llm_tailnet)); then log "LLM: $llm_host (tailnet) — Tailscale 사이드카의 HTTP 프록시 경유"; fi
 log "작업 폴더: $ws"
 if ((${#roots[@]} > 1)); then log "프로젝트 루트: ${roots[*]:1}"; fi
 case "$role" in
